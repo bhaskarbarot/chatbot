@@ -31,7 +31,7 @@ FAISS_INDEX_PATH = os.path.join(os.path.dirname(__file__), "knowledge", "faiss_i
 MAX_RESPONSE_TIME = int(os.getenv("MAX_RESPONSE_TIME", "30"))
 MAX_MONGO_RESULTS = int(os.getenv("MAX_MONGO_RESULTS", "50"))
 TOP_K_RULES = int(os.getenv("TOP_K_RULES", "5"))
-RETRIEVAL_MIN_SCORE = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.70"))
+RETRIEVAL_MIN_SCORE = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.65"))
 RETRIEVAL_MIN_MARGIN = float(os.getenv("RETRIEVAL_MIN_MARGIN", "0.06"))
 
 # ── Cache (Redis) ────────────────────────────────────

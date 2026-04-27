@@ -50,7 +50,8 @@ _PATTERNS: List[Tuple[re.Pattern, Intent, float]] = [
     (re.compile(r"\bpending\s+tasks?\b|\btasks?.*\bpending\b|\bopen\s+tasks?\b", re.I), Intent.PENDING_TASKS, 1.0),
     (re.compile(r"^\s*who\s+is\s+[a-z]", re.I), Intent.PERSON_LOOKUP, 1.0),
     (re.compile(r"\b(show|list|give|get)\b.*\b(last|recent|latest)\s+\d+\b"
-                r"|\blast\s+\d+\b.*\b(deal|invoice|contact|company)\b", re.I), Intent.LIST_RECENT, 0.8),
+                r"|\blast\s+\d+\b.*\b(deals?|invoices?|contacts?|compan(?:y|ies)|tasks?|leads?)\b",
+                re.I), Intent.LIST_RECENT, 0.8),
 ]
 
 # Secondary signals that boost confidence when present alongside a primary match
@@ -95,6 +96,14 @@ _ENTITY_TO_COLLECTION: Dict[str, str] = {
     "bill": "bills", "bills": "bills",
     "vendor": "vendors", "vendors": "vendors",
     "target": "targets", "targets": "targets",
+    # Lookup / reference collections
+    "department": "departments", "departments": "departments",
+    "technology": "technologies", "technologies": "technologies",
+    "source": "sources", "sources": "sources",
+    "region": "regions", "regions": "regions",
+    "campaign": "campaigns", "campaigns": "campaigns",
+    "tax": "taxes", "taxes": "taxes",
+    "payment": "payments", "payments": "payments",
 }
 
 

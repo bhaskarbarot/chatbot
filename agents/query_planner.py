@@ -138,21 +138,31 @@ def plan_query(user_query: str, matched_rules: List[Dict],
 def _generate_and_validate_plan_safe(
     llm: Any, prompt: str, user_query: str, breaker: Any
 ) -> Tuple[Optional[Dict], Optional[str]]:
-    """Wrapper that routes llm.invoke through the circuit breaker."""
+    """
+    Wrapper that routes ONLY the network call (llm.invoke) through the circuit
+    breaker.  Content/validation failures (bad JSON, schema errors) are soft
+    errors — they do NOT trip the breaker because they indicate an LLM output
+    quality issue, not a connectivity failure.
+    """
     result_holder: list = [None]
-    error_holder: list = ["Circuit breaker prevented call"]
+    error_holder: list = ["No result"]
 
     def _invoke():
+        # Only this line can raise a connectivity exception that trips the breaker.
         response = llm.invoke(prompt)
         raw_text = response.content.strip()
         logger.debug(f"LLM raw output: {raw_text[:500]}")
+
+        # Content validation — failures here silently return None (no exception).
         plan = _extract_json(raw_text)
         if not isinstance(plan, dict):
-            raise ValueError("Could not extract a JSON object from model output.")
+            error_holder[0] = "Could not extract a JSON object from model output."
+            return
         plan = _postprocess_plan(plan, user_query)
         err = _validate_plan_schema(plan)
         if err:
-            raise ValueError(err)
+            error_holder[0] = err
+            return
         result_holder[0] = plan
         error_holder[0] = None
 

@@ -15,6 +15,7 @@ CRITICAL RULES:
 6. "Intrested" (not Interested) is the DB spelling for outreach leadStatus.
 7. Invoice amount field: grandtotal_in_usd (no underscore before 'in'). Deal amount: grand_total_in_usd (with underscore).
 8. Invoice payment_status enum: "draft" | "paid" | "confirmed" | "cancelled" | "partial_payment"
+   Sales order status enum: "Draft" | "Confirm" | "Cancelled"  (note: Confirm not Confirmed)
 9. Financial year default: Indian FY (Apr 1 to Mar 31).
 10. "Customer since" = companies.leadWonAt field.
 11. Return strict MongoDB operators only. Never emit Extended JSON wrappers like {"$date": "..."} or {"$oid": "..."} in query plans.
