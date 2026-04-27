@@ -1,0 +1,258 @@
+========================
+MAIN BUSINESS QUERIES
+
+LEADS & CUSTOMERS
+
+Which leads have not been contacted in 7 days
+List new leads from this week
+List new leads this month
+New leads this week
+New leads this month
+What is the conversion rate from lead to customer
+Conversion rate from lead to customer
+Which customers have not given business in 3 months
+Who is Ketul
+
+REVENUE & SALES
+
+Total revenue generated in FY2025
+Total revenue this financial year
+Total revenue of last month
+Show me total sales for last month
+Total sales for last month
+Total collection
+
+INVOICES & PAYMENTS
+
+Pending invoices
+Overdue payments
+Overdue invoice aging and outstanding amount by company
+
+DEALS & PIPELINE
+
+How many deals are there
+Give me all deals
+Give me closed won deals
+Closed won deals
+Which deals are stuck in the proposal stage
+Opportunities lost in July
+Lost deals last quarter
+Sales pipeline by stage
+Pipeline distribution by stage
+
+PERFORMANCE & ANALYTICS
+
+Top 10 customers by revenue
+Show me the top 10 customers by revenue
+Which sales rep closed the most deals this quarter
+Top performing sales owners in last 6 months with monthly trend
+Funnel performance and conversion to closed won by owner
+Best product and project type combinations by value avg deal size and win rate
+High activity companies with weak payment conversion
+
+TASKS & ACTIVITIES
+
+What tasks are pending
+Pending tasks
+What tasks are pending for the sales team
+What tasks are pending for the users
+Any follow-ups overdue this week
+
+CONTACTS
+
+Last 5 contacts details
+
+ORGANIZATION
+
+How many departments
+========================
+CRM COMMANDS (COMPLETE)
+
+GENERAL
+
+Get details for this company [name]
+Get details for this contact [name]
+Get details for this deal [name/id]
+Get details for this invoice [number]
+Get details for this sales order [number]
+
+LINKED DATA
+
+Get tasks linked to this company [company]
+Get tasks linked to this deal [deal]
+Get contacts linked to this company [company]
+Get deals linked to this company [company]
+Get invoices linked to this company [company]
+Get sales orders linked to this company [company]
+
+MEETINGS & TASKS
+
+Get meetings for today
+Get upcoming meetings for this user [user]
+Get all open tasks for this user [user]
+Get tasks due on this date [date]
+
+DEALS
+
+Get deals in this stage [stage]
+Get deals closing on this date [date]
+Get deals owned by this user [user]
+
+INVOICES
+
+Get invoices due on this date [date]
+Get invoices with status [Paid/Unpaid/Partial]
+
+SALES ORDERS
+
+Get sales orders with status [Draft/Confirm/Cancelled]
+Get confirmed sales orders
+Get cancelled sales orders
+Get draft sales orders
+Get sales order details [SO Number]
+Get sales orders owned by this user [user]
+Get sales orders created by this user [user]
+Get sales orders between date range [start - end]
+Get sales orders between amount range [min - max]
+
+COMPANIES & CONTACT FILTERS
+
+Get companies by region [region]
+Get companies by source [source]
+Get contacts by job title [title]
+Get contacts created on this date [date]
+
+REPORTS & ANALYTICS
+
+Get pipeline summary for this period [range]
+Get leads by source for this period
+Get deals by stage for this period
+Get revenue summary for this period
+Get regional performance for this period
+Get top products for this period
+Get lost leads and reasons for this period
+
+TARGETS
+
+Get target details for this user [user]
+Get target vs achieved for all users
+Get performance by user
+Get performance monthly / yearly / quarterly
+
+OUTREACH
+
+Get outreach data for dataset [dataset]
+Get interested leads for last 7 days
+Get unique touches and total touches
+Get outreach contacts by region [region]
+Get outreach history for contact
+
+PRODUCTS & SYSTEM
+
+Get product details for product [name]
+Get products under technology [technology]
+Get tax details for tax [name]
+Get all payment methods
+Get all industries
+Get all technologies
+Get all sources
+Get company management settings
+Get SMTP configuration details
+Get file upload limit
+
+ADVANCED FETCH LOGIC
+
+Fetch all data related to this message
+Fetch only records matching name/date/number
+Identify intent and fetch correct module
+Fetch correct CRM module data
+If multiple results exist, list all
+========================
+ACCOUNT MODULE
+Get account details for [Account Name]
+Get account owner for [Account Name]
+Get phone number for [Account Name]
+Get email for [Account Name]
+Get account type for [Account Name]
+Get country for [Account Name]
+Get source for [Account Name]
+Get creation date for [Account Name]
+Get customer since date for [Account Name]
+Get last activity for [Account Name]
+Get last business date for [Account Name]
+Get address details for [Account Name]
+Get industry for [Account Name]
+Get annual revenue for [Account Name]
+Get website for [Account Name]
+Get billing address for [Account Name]
+Get territory for [Account Name]
+Get total deals value for [Account Name]
+Get total invoices amount for [Account Name]
+Get tasks for [Account Name]
+Get meeting history for [Account Name]
+Get sales status for [Account Name]
+========================
+DEALS MODULE
+Get all deals for [Account Name]
+Get open deals for [Account Name]
+Get deal stages for [Account Name]
+Get deal owners for [Account Name]
+Get total deal amount for [Account Name]
+Get deal value in USD for [Account Name]
+Get deal created dates for [Account Name]
+Get deal closing dates for [Account Name]
+Get amount for [Deal Name]
+Get stage details for [Deal Name]
+Get account owner for [Deal Name]
+Get deals in Closed Won
+Get deals in Closed Lost
+Get highest value deal
+Get lowest value deal
+Get overdue deals
+Get upcoming closing deals
+========================
+CONTACTS MODULE
+Get contact details for [Contact Name]
+Get contact email for [Contact Name]
+Get contact phone for [Contact Name]
+Get contact owner for [Contact Name]
+Get contact account for [Contact Name]
+Get contact creation date
+Get last activity for [Contact Name]
+Get contacts by owner
+Get contacts by source
+Get contacts by region
+Get contacts by country
+Get contacts by lead status
+Get contacts created after/before date
+========================
+TASKS MODULE
+Get tasks owned by [User Name]
+Get tasks with priority [Priority Level]
+Get tasks with status [Status]
+Get tasks due before [Date]
+Get tasks due after [Date]
+Get tasks created before [Date]
+Get tasks created after [Date]
+Get tasks with reminder
+Get tasks with category
+Get tasks associated with account
+Get tasks associated with contact
+Get overdue tasks
+Get count of tasks by status/owner/date
+========================
+INVOICE MODULE
+Get invoice details [Invoice Number]
+Get invoice status
+Get invoice date
+Get invoice due date
+Get invoice amount
+Get remaining amount
+Get payment history
+Get invoices by status
+Get overdue invoices
+Get invoices due this week
+Get invoices pending payment
+Get invoices above/below amount
+Get total invoiced amount
+Get total remaining amount
