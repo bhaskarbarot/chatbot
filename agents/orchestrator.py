@@ -40,6 +40,8 @@ from knowledge.intent_classifier import (
     CONFIDENCE_THRESHOLD,
     Intent,
 )
+from knowledge.query_understander import understand as understand_query, QueryIntent
+from knowledge.relationship_graph import get_graph
 from memory.chat_memory import ChatMemory
 from knowledge.vector_store import (
     keyword_boost_search, is_index_built, evaluate_match_confidence, get_embedding_model
@@ -109,18 +111,61 @@ class ChatOrchestrator:
             if is_followup:
                 self._log("Follow-up resolved", f"'{user_query}' -> '{resolved_query}'")
 
-            # Step 2.1: Context matching — check if new query relates to last conversation
+            # Step 2.1: Deep query understanding — extract intent, limit, sort, entities
+            qparams = understand_query(resolved_query)
+            self._log(
+                "Query understood",
+                f"intent={qparams.intent.value} limit={qparams.limit} "
+                f"sort={qparams.sort_reason} entities={qparams.entity_names}",
+            )
+            record_event("query_understood", {
+                "intent": qparams.intent.value,
+                "limit": qparams.limit,
+                "sort_reason": qparams.sort_reason,
+                "collection_hints": qparams.collection_hints[:3],
+            })
+
+            # Step 2.1b: Context matching
             if not is_followup and self.memory.short_term:
                 is_related, ctx_hint = self.memory.is_contextually_related(resolved_query)
-                if is_related:
-                    self._log("Context match", "Query is related to previous conversation context")
-                else:
-                    self._log("Context match", "New topic — using fresh context")
+                self._log(
+                    "Context match",
+                    "Query is related to previous conversation context"
+                    if is_related else "New topic — using fresh context",
+                )
 
             # Step 2.25: Fast person lookup for "who is <name>" queries
             person_result = self._person_lookup_pipeline(user_query, resolved_query, start_time)
             if person_result is not None:
                 return person_result
+
+            # Step 2.28: Owner-names lookup ("give me owner names of X")
+            owner_result = self._owner_names_pipeline(user_query, resolved_query, start_time)
+            if owner_result is not None:
+                return owner_result
+
+            # Step 2.29: Company-linked data pipeline ("Company X [collection] [fields]")
+            company_linked_result = self._company_linked_query_pipeline(
+                user_query, resolved_query, qparams, start_time
+            )
+            if company_linked_result is not None:
+                return company_linked_result
+
+            # Step 2.26: Existence query pipeline ("any Pankaj contact available?")
+            if qparams.intent == QueryIntent.EXISTENCE and qparams.existence_target:
+                exist_result = self._existence_pipeline(
+                    user_query, resolved_query, qparams, start_time
+                )
+                if exist_result is not None:
+                    return exist_result
+
+            # Step 2.27: Comparison / percentage pipeline
+            if qparams.intent in (QueryIntent.PERCENTAGE, QueryIntent.COMPARISON):
+                cmp_result = self._comparison_pipeline(
+                    user_query, resolved_query, qparams, start_time
+                )
+                if cmp_result is not None:
+                    return cmp_result
 
             # Step 2.3: Hard meetings routing pipeline
             meetings_result = self._meetings_query_pipeline(user_query, resolved_query, start_time)
@@ -188,6 +233,13 @@ class ChatOrchestrator:
                         })
                         fast_plan = self._apply_business_intent_overrides(resolved_query, fast_plan)
                         fast_plan = self._apply_entity_constraints(resolved_query, fast_plan)
+                        # Apply sort/limit from query understander on fast-path too
+                        if qparams.limit:
+                            fast_plan["limit"] = qparams.limit
+                        if qparams.sort_field and qparams.sort_reason in ("low_value", "high_value"):
+                            fast_plan = self._apply_understander_sort(
+                                fast_plan, qparams.sort_field, qparams.sort_direction, qparams.sort_reason
+                            )
                         data = execute_query_plan(fast_plan)
                         if not self._is_empty_result(data):
                             result_count = self._estimate_result_count(data)
@@ -278,13 +330,28 @@ class ChatOrchestrator:
             elif matched_rules:
                 self._log("Rule-compiled plan skipped", "Low retrieval confidence; using LLM planning")
 
-            # Step 5b: LLM plan generation
+            # Step 5b: LLM plan generation (with relationship + sort/limit context)
             if not query_plan:
                 self._log("Planning query", "Sending to LLM...")
+                # Build relationship context for LLM
+                rel_ctx = get_graph().prompt_context(
+                    qparams.collection_hints or self._guess_collections(resolved_query)
+                )
+                # Build sort hint string for prompt
+                sort_hint_str = ""
+                if qparams.sort_field and qparams.sort_reason:
+                    dir_word = "ascending (smallest first)" if qparams.sort_direction == 1 else "descending (largest first)"
+                    sort_hint_str = (
+                        f"Sort by '{qparams.sort_field}' field {dir_word} "
+                        f"(reason: user asked for '{qparams.sort_reason}' values)."
+                    )
                 query_plan = plan_query(
                     user_query, matched_rules, chat_context,
                     resolved_query if is_followup else None,
                     format_hint=format_hint,
+                    relationship_context=rel_ctx,
+                    sort_hint=sort_hint_str,
+                    limit_override=qparams.limit,
                 )
 
             if not query_plan:
@@ -301,6 +368,23 @@ class ChatOrchestrator:
             query_plan = self._apply_entity_constraints(resolved_query, query_plan)
             query_plan = self._align_plan_with_collection_intent(resolved_query, query_plan)
             query_plan = self._apply_temporal_sort_policy(resolved_query, query_plan)
+            # Apply dynamic limit from query understander (overrides LLM default)
+            if qparams.limit:
+                if query_plan.get("type") == "find":
+                    query_plan["limit"] = qparams.limit
+                elif query_plan.get("type") == "aggregate":
+                    pipeline = query_plan.get("pipeline", [])
+                    pipeline = [s for s in pipeline if "$limit" not in s]
+                    pipeline.append({"$limit": qparams.limit})
+                    query_plan["pipeline"] = pipeline
+                self._log("Dynamic limit", f"Applied user-specified limit={qparams.limit}")
+
+            # Apply sort direction from query understander (overrides LLM sort for low/high queries)
+            if qparams.sort_field and qparams.sort_reason in ("low_value", "high_value"):
+                query_plan = self._apply_understander_sort(
+                    query_plan, qparams.sort_field, qparams.sort_direction,
+                    qparams.sort_reason
+                )
 
             # Step 6: Execute query
             self._log("Executing query", "...")
@@ -701,6 +785,254 @@ class ChatOrchestrator:
             sections.append("")
 
         return "\n".join(sections)
+
+    # ── Existence Pipeline ────────────────────────────
+
+    def _existence_pipeline(
+        self, user_query: str, resolved_query: str, qparams: Any, start_time: float
+    ) -> Optional[Dict]:
+        """
+        Handle YES/NO existence queries: "any Pankaj contact available?"
+        Searches only for exactly what was asked — returns minimal relevant result.
+        """
+        target = qparams.existence_target
+        etype = qparams.existence_entity_type or ""
+        self._log("Existence query", f"target='{target}' type='{etype}'")
+
+        # Determine collection from entity type hint
+        etype_map = {
+            "contact": "contacts", "contacts": "contacts",
+            "company": "companies", "companies": "companies",
+            "deal": "deals", "deals": "deals",
+            "invoice": "invoices", "invoices": "invoices",
+            "user": "users", "users": "users",
+            "lead": "outreaches", "outreach": "outreaches",
+            "task": "createtasks", "tasks": "createtasks",
+        }
+        collection = etype_map.get(etype.lower(), "")
+
+        # If no entity type, guess from collection hints
+        if not collection and qparams.collection_hints:
+            collection = qparams.collection_hints[0]
+        if not collection:
+            guessed = self._guess_collections(resolved_query)
+            collection = guessed[0] if guessed else "contacts"
+
+        # Build search filter — regex on likely name fields
+        name_fields_map = {
+            "contacts": [
+                {"$or": [
+                    {"firstName": {"$regex": target, "$options": "i"}},
+                    {"lastName": {"$regex": target, "$options": "i"}},
+                ]},
+            ],
+            "companies": [{"companyName": {"$regex": target, "$options": "i"}}],
+            "deals": [{"name": {"$regex": target, "$options": "i"}}],
+            "users": [{"name": {"$regex": target, "$options": "i"}}],
+            "invoices": [{"invoice_number": {"$regex": target, "$options": "i"}}],
+            "createtasks": [{"Task": {"$regex": target, "$options": "i"}}],
+        }
+        filters = name_fields_map.get(collection, [{"name": {"$regex": target, "$options": "i"}}])
+
+        for filt in filters:
+            results = execute_query_plan({
+                "type": "find",
+                "collection": collection,
+                "filter": filt,
+                "limit": 3,
+                "sort": [["createdAt", -1]],
+            })
+            if isinstance(results, list) and results:
+                count = len(results)
+                from utils.formatter import auto_format
+                data_response = auto_format(
+                    results, user_query, "detail",
+                    response_meta=self._build_response_meta(
+                        {"type": "find", "collection": collection, "filter": filt},
+                        user_query, results,
+                    ),
+                )
+                response = (
+                    f"Yes, found {count} record(s) matching '{target}' in {collection}.\n"
+                    f"{data_response}"
+                )
+                response = mask_response(response)
+                self.memory.add_exchange(user_query, response, collection=collection)
+                return self._build_result(response, start_time, format_type="detail",
+                                          collection=collection)
+
+        # Not found
+        response = (
+            f"No, '{target}' was not found in {collection}.\n"
+            f"The CRM has no {etype or 'record'} matching this name.\n"
+            f"Try checking spelling or searching in a different module."
+        )
+        return self._build_result(response, start_time, format_type="not_found",
+                                  collection=collection)
+
+    # ── Comparison / Percentage Pipeline ─────────────
+
+    def _comparison_pipeline(
+        self, user_query: str, resolved_query: str, qparams: Any, start_time: float
+    ) -> Optional[Dict]:
+        """
+        Handle percentage / comparison queries:
+        "how many % difference between Closed Won & Closed Lost?"
+
+        Strategy:
+        1. Detect the dimension field (stage, status, payment_status, priority…)
+        2. Run a single $group aggregate to get counts for ALL categories
+        3. Filter results to the compared entities
+        4. Compute and render percentages
+        """
+        entities = qparams.compare_entities
+        if not entities or len(entities) < 2:
+            return None
+
+        # Detect "all X" as a total-denominator signal (not a group to match)
+        # e.g. "all deals" means total count; "closed lost" is the specific group
+        _ALL_TOKENS = {"all", "total", "every", "entire", "complete"}
+        total_override_entity = None
+        filtered_entities = []
+        for ent in entities:
+            first_word = ent.strip().split()[0].lower() if ent.strip() else ""
+            if first_word in _ALL_TOKENS:
+                total_override_entity = ent  # this one IS the total
+            else:
+                filtered_entities.append(ent)
+
+        # Determine collection
+        collection = (qparams.collection_hints[0]
+                      if qparams.collection_hints else
+                      self._guess_collections(resolved_query)[0]
+                      if self._guess_collections(resolved_query) else "deals")
+
+        self._log("Comparison pipeline", f"entities={entities} collection={collection}")
+
+        # Get total count for denominator
+        total_all_count = execute_query_plan({
+            "type": "count", "collection": collection, "filter": {}
+        })
+        total_all = int(total_all_count) if isinstance(total_all_count, (int, float)) else 0
+
+        # Infer grouping field from the entities or collection
+        work_entities = filtered_entities if total_override_entity else entities
+        group_field = self._infer_comparison_field(work_entities, collection)
+        self._log("Comparison field", group_field)
+
+        # Aggregate: count all groups
+        agg_result = execute_query_plan({
+            "type": "aggregate",
+            "collection": collection,
+            "pipeline": [
+                {"$group": {"_id": f"${group_field}", "count": {"$sum": 1}}},
+            ],
+        })
+
+        if not isinstance(agg_result, list) or not agg_result:
+            return None
+
+        # Build lookup dict: {group_label_lower → count}
+        group_counts: Dict[str, int] = {}
+        agg_total = 0
+        for row in agg_result:
+            label = str(row.get("_id") or "Unknown").lower()
+            cnt = int(row.get("count", 0))
+            group_counts[label] = cnt
+            agg_total += cnt
+
+        if total_all == 0:
+            total_all = agg_total
+        if total_all == 0:
+            return None
+
+        # If user asked "all X vs Y" — include total as first entry
+        if total_override_entity:
+            matched: Dict[str, int] = {total_override_entity: total_all}
+            for ent in filtered_entities:
+                ent_lower = ent.lower().strip()
+                if ent_lower in group_counts:
+                    matched[ent] = group_counts[ent_lower]
+                else:
+                    for label, cnt in group_counts.items():
+                        if ent_lower in label or label in ent_lower:
+                            matched[ent] = matched.get(ent, 0) + cnt
+        else:
+            matched = {}
+            for ent in entities:
+                ent_lower = ent.lower().strip()
+                if ent_lower in group_counts:
+                    matched[ent] = group_counts[ent_lower]
+                    continue
+                for label, cnt in group_counts.items():
+                    if ent_lower in label or label in ent_lower:
+                        matched[ent] = matched.get(ent, 0) + cnt
+
+        if len(matched) < 2:
+            # If only 1 matched (specific group requested vs total), still show
+            if total_override_entity and len(matched) >= 1:
+                pass  # show what we have
+            else:
+                return None
+
+        # Build response
+        lines = [
+            f"Found {len(matched)} groups to compare | "
+            f"Field: {group_field} | Collection: {collection}",
+            f"Query echo -> Entities: {' vs '.join(entities)} | Total records: {total_all}",
+            f"Comparison Results:",
+            "",
+        ]
+        pcts: List[float] = []
+        for ent, cnt in matched.items():
+            pct = (cnt / total_all) * 100
+            pcts.append(pct)
+            lines.append(f"  {ent}: {cnt} record(s) ({pct:.1f}%)")
+
+        if len(pcts) == 2:
+            diff = abs(pcts[0] - pcts[1])
+            lines.append(f"\nDifference: {diff:.1f}%")
+
+        lines.append(f"\nTotal {collection}: {total_all}")
+        lines.append("Ask for a detailed breakdown to see all categories.")
+
+        response = "\n".join(lines)
+        response = mask_response(response)
+        self.memory.add_exchange(user_query, response, collection=collection)
+        return self._build_result(response, start_time, format_type="summary",
+                                  collection=collection)
+
+    def _infer_comparison_field(self, entities: List[str], collection: str) -> str:
+        """
+        Infer the MongoDB field to group by for a comparison query.
+        Driven entirely by the entity names and collection — no hardcoding.
+        """
+        entities_lower = " ".join(e.lower() for e in entities)
+
+        # Keyword signals → field name
+        signals = [
+            (["won", "lost", "closed", "open", "negotiation", "proposal", "stage"], "stage"),
+            (["paid", "draft", "confirmed", "cancelled", "partial", "payment"], "payment_status"),
+            (["pending", "completed", "open", "in progress", "status"], "status"),
+            (["high", "medium", "low", "priority"], "priority"),
+            (["active", "inactive", "lifecycle", "lead status"], "leadStatus"),
+            (["region", "territory", "usa", "apac", "emea"], "region"),
+            (["source", "organic", "email", "campaign"], "source"),
+        ]
+        for keywords, field in signals:
+            if any(kw in entities_lower for kw in keywords):
+                return field
+
+        # Fall back to schema sample
+        from tools.mongodb_tool import get_collection_sample
+        samples = get_collection_sample(collection, limit=3)
+        for row in samples:
+            if isinstance(row, dict):
+                for candidate in ["stage", "status", "payment_status", "priority",
+                                   "leadStatus", "lifecycleStage"]:
+                    if candidate in row:
+                        return candidate
+        return "status"
 
     # ── Existing Pipeline Methods (preserved) ─────────
 
@@ -1900,10 +2232,12 @@ class ChatOrchestrator:
             return None
 
         self._log("Person lookup", f"name={name}")
+
+        # Always use case-insensitive regex — never exact match
         users = execute_query_plan({
             "type": "find",
             "collection": "users",
-            "filter": {"name": name},
+            "filter": {"name": {"$regex": name, "$options": "i"}},
             "sort": [["name", 1]],
             "limit": 1,
         })
@@ -1915,15 +2249,28 @@ class ChatOrchestrator:
             return self._build_result(response, start_time, format_type="summary",
                                       entity=entity, collection="users")
 
+        # Build contact filter: handle single name OR "First Last" format
+        name_parts = name.strip().split()
+        if len(name_parts) >= 2:
+            first, last = name_parts[0], " ".join(name_parts[1:])
+            contact_filter = {
+                "$and": [
+                    {"firstName": {"$regex": first, "$options": "i"}},
+                    {"lastName": {"$regex": last, "$options": "i"}},
+                ]
+            }
+        else:
+            contact_filter = {
+                "$or": [
+                    {"firstName": {"$regex": name, "$options": "i"}},
+                    {"lastName": {"$regex": name, "$options": "i"}},
+                ]
+            }
+
         contacts = execute_query_plan({
             "type": "find",
             "collection": "contacts",
-            "filter": {
-                "$or": [
-                    {"firstName": name},
-                    {"lastName": name},
-                ]
-            },
+            "filter": contact_filter,
             "sort": [["createdAt", -1]],
             "limit": 1,
         })
@@ -1965,6 +2312,369 @@ class ChatOrchestrator:
             f"Last login: {last_login}\n"
             "Ask 'show full details' if you want the complete profile."
         )
+
+    def _company_linked_query_pipeline(
+        self, user_query: str, resolved_query: str, qparams: Any, start_time: float
+    ) -> Optional[Dict]:
+        """
+        Handle queries that ask for data from a collection linked to a specific company.
+
+        Patterns:
+          "Transportation Services this company invoice payment status and currency"
+          "Transportation Services this company invoice who created give me name"
+          "Transportation Services this company invoice owner name"
+
+        Flow:
+          1. Detect "this company" + company name + target collection
+          2. Resolve company name → _id via companies collection
+          3. Query target collection filtered by company
+          4. If field resolution needed (owner/created by → user name),
+             use relationship graph to find FK field and join with users
+        """
+        q = resolved_query.lower()
+
+        # Must contain "this company" to trigger
+        if "this company" not in q:
+            return None
+
+        # Extract company name from qparams (already extracted by query understander)
+        company_name = (qparams.entity_names[0]
+                        if qparams.entity_names else None)
+        if not company_name:
+            return None
+
+        # Detect target collection from keywords
+        coll_keywords = [
+            (["invoice", "invoices", "billing", "bill"], "invoices"),
+            (["deal", "deals", "opportunity"], "deals"),
+            (["contact", "contacts"], "contacts"),
+            (["task", "tasks"], "createtasks"),
+            (["sales order", "sales"], "sales"),
+            (["note", "notes"], "commonnotes"),
+            (["meeting", "meetings"], "meetings"),
+        ]
+        target_coll = None
+        for keywords, coll in coll_keywords:
+            if any(kw in q for kw in keywords):
+                target_coll = coll
+                break
+
+        if not target_coll:
+            return None
+
+        self._log(
+            "Company-linked pipeline",
+            f"company='{company_name}' collection={target_coll}"
+        )
+
+        # Step 1: Resolve company name → ObjectId
+        company_id = resolve_name_to_id(company_name, "company")
+        if not company_id:
+            response = (
+                f"No company named '{company_name}' was found in the CRM.\n"
+                f"Check the spelling or try a partial name."
+            )
+            return self._build_result(response, start_time, format_type="not_found",
+                                      collection="companies")
+
+        # Step 2: Determine company FK field in target collection
+        # Use relationship graph dynamically — no hardcoding
+        graph = get_graph()
+        company_fk = "company"  # default
+        for edge in graph.joins_from(target_coll):
+            if edge["foreign_collection"] == "companies":
+                company_fk = edge["local_field"]
+                break
+
+        # Step 3: Convert company_id string → ObjectId for proper MongoDB match
+        from bson import ObjectId as _ObjId
+        try:
+            cid_obj = _ObjId(str(company_id)) if re.match(r"^[0-9a-fA-F]{24}$", str(company_id)) else company_id
+        except Exception:
+            cid_obj = company_id
+
+        # Step 4: Query the linked collection
+        records = execute_query_plan({
+            "type": "find",
+            "collection": target_coll,
+            "filter": {company_fk: cid_obj},
+            "sort": [["createdAt", -1]],
+            "limit": 20,
+        })
+
+        if self._is_empty_result(records):
+            response = (
+                f"No {target_coll} found for company '{company_name}'.\n"
+                f"The company exists but has no linked {target_coll} records."
+            )
+            return self._build_result(response, start_time, format_type="not_found",
+                                      collection=target_coll)
+
+        # Step 4: Detect if user wants a specific FK field resolved to a name
+        # Use relationship graph to find FK fields pointing to users
+        graph = get_graph()
+        user_fk_fields = [
+            e["local_field"] for e in graph.joins_from(target_coll)
+            if e["foreign_collection"] == "users"
+        ]
+
+        # Match query keywords to FK field names (dynamic, no hardcoding)
+        requested_fk = self._match_fk_field_from_query(q, user_fk_fields)
+
+        if requested_fk:
+            # Resolve the FK → user names and return a focused response
+            return self._resolve_fk_names_response(
+                user_query, records, target_coll, company_name,
+                requested_fk, start_time
+            )
+
+        # Step 5: Standard format — show records with relevant fields
+        plan_meta = {
+            "type": "find",
+            "collection": target_coll,
+            "filter": {company_fk: company_id},
+        }
+        response = auto_format(
+            records, user_query, "list",
+            response_meta=self._build_response_meta(plan_meta, user_query, records),
+        )
+        response = mask_response(response)
+        self.memory.add_exchange(user_query, response, collection=target_coll)
+        return self._build_result(response, start_time, format_type="list",
+                                  collection=target_coll)
+
+    def _match_fk_field_from_query(self, ql: str, fk_fields: List[str]) -> Optional[str]:
+        """
+        Dynamically match a query's intent to a FK field name using keyword overlap.
+        No hardcoding — driven entirely by field names from the relationship graph.
+        """
+        best_field = None
+        best_score = 0
+
+        for field in fk_fields:
+            # Split camelCase into component words
+            words = re.findall(r"[a-z]+", re.sub(r"([A-Z])", r" \1", field).lower())
+            score = sum(1 for w in words if w in ql and len(w) > 2)
+            if score > best_score:
+                best_score = score
+                best_field = field
+
+        return best_field if best_score > 0 else None
+
+    def _resolve_fk_names_response(
+        self, user_query: str, records: List[Dict],
+        collection: str, company_name: str,
+        fk_field: str, start_time: float
+    ) -> Dict:
+        """
+        Resolve a FK ObjectId field to user names and return a formatted response.
+        Used for "who created", "owner name" type queries.
+        """
+        from bson import ObjectId as _ObjId
+        from tools.mongodb_tool import get_db as _get_db
+
+        # Collect all unique FK ObjectIds
+        oid_to_name: Dict[str, str] = {}
+        oid_list = []
+        for rec in records:
+            raw = str(rec.get(fk_field) or "")
+            if re.match(r"^[0-9a-fA-F]{24}$", raw):
+                try:
+                    oid_list.append(_ObjId(raw))
+                except Exception:
+                    pass
+
+        if oid_list:
+            try:
+                db = _get_db()
+                for u in db["users"].find(
+                    {"_id": {"$in": oid_list}}, {"name": 1, "email": 1}
+                ):
+                    oid_to_name[str(u["_id"])] = u.get("name") or u.get("email") or str(u["_id"])
+            except Exception as exc:
+                logger.warning(f"FK name resolution failed: {exc}")
+
+        # Build clean response
+        field_label = re.sub(r"([A-Z])", r" \1", fk_field).strip().title()
+        lines = [
+            f"Found {len(records)} {collection} record(s) | Filter: company = '{company_name}' | Collection: {collection}",
+            f"Query echo -> Entity: {collection} | Field resolved: {fk_field} → users | Returned: {len(records)} records",
+            f"{field_label} for {company_name}'s {collection}:",
+            "",
+        ]
+
+        seen_names: List[str] = []
+        for rec in records:
+            raw = str(rec.get(fk_field) or "")
+            name = oid_to_name.get(raw, raw[:19] + "xxxxx" if len(raw) >= 24 else raw)
+            inv_no = rec.get("invoice_number") or rec.get("name") or str(rec.get("_id", ""))[:10]
+            if name not in seen_names:
+                seen_names.append(name)
+            lines.append(f"  {inv_no}: {field_label} = {name}")
+
+        if seen_names:
+            unique_names = list(dict.fromkeys(seen_names))
+            lines.append(f"\nUnique {field_label}(s): {', '.join(unique_names)}")
+
+        response = "\n".join(lines)
+        response = mask_response(response)
+        self.memory.add_exchange(user_query, response, collection=collection)
+        return self._build_result(response, start_time, format_type="list",
+                                  collection=collection)
+
+    def _apply_understander_sort(
+        self, plan: Dict[str, Any], sort_field: str,
+        direction: int, reason: str
+    ) -> Dict[str, Any]:
+        """
+        Override plan sort when user explicitly asks for low/high/latest/oldest.
+        Maps generic sort_field token ('amount', 'createdAt') to actual DB field
+        by sampling the collection schema.
+        """
+        out = dict(plan)
+        coll = out.get("collection", "")
+
+        # Map generic token to likely DB field for this collection
+        amount_fields = {
+            "invoices": "grandtotal_in_usd",
+            "deals": "grand_total_in_usd",
+            "sales": "grand_total_in_usd",
+            "bills": "netPayableAmount",
+        }
+        date_fields = {
+            "invoices": "invoice_date",
+            "deals": "createdAt",
+            "createtasks": "due_date",
+            "contacts": "createdAt",
+            "companies": "createdAt",
+        }
+
+        if sort_field == "amount":
+            real_field = amount_fields.get(coll, "grand_total_in_usd")
+        else:
+            real_field = date_fields.get(coll, "createdAt")
+
+        self._log("Sort override", f"field={real_field} dir={direction} reason={reason}")
+
+        if out.get("type") == "find":
+            out["sort"] = [[real_field, direction]]
+            # Remove any extra date/status filters added by LLM for low/high sort queries
+            # (user only asked for sort, not a filtered subset)
+            if reason in ("low_value", "high_value") and isinstance(out.get("filter"), dict):
+                filt = dict(out["filter"])
+                # Remove ALL LLM-added filters — user only asked for sort, not a subset
+                noisy_keys = [
+                    "payment_status", "invoice_date", "sales_date", "createdAt",
+                    "grandtotal_in_usd", "grand_total_in_usd", "grand_total",
+                    "subtotal_in_usd", "subtotal", "amount", "netPayableAmount",
+                ]
+                for noisy_key in noisy_keys:
+                    filt.pop(noisy_key, None)
+                # Also remove any existence-only conditions ($exists) on amount fields
+                for k in list(filt.keys()):
+                    if isinstance(filt[k], dict) and list(filt[k].keys()) == ["$exists"]:
+                        filt.pop(k, None)
+                out["filter"] = filt
+        elif out.get("type") == "aggregate":
+            pipeline = out.get("pipeline", [])
+            # Remove existing $sort stages, add new one
+            pipeline = [s for s in pipeline if "$sort" not in s]
+            pipeline.append({"$sort": {real_field: direction}})
+            out["pipeline"] = pipeline
+
+        return out
+
+    def _owner_names_pipeline(
+        self, user_query: str, resolved_query: str, start_time: float
+    ) -> Optional[Dict]:
+        """
+        Handle "give me owner names of [X]" queries.
+        Fetches the primary collection, resolves owner ObjectIds via users join,
+        and returns a clean list of owner names.
+        """
+        q = resolved_query.lower()
+        # Only trigger for AGGREGATE owner-listing queries — NOT specific field lookups
+        # Must have owner + names + of a collection (not "created by" or single-entity lookups)
+        if not re.search(r'\bowner\s+names?\s+of\b|\bowners?\s+of\b|\ball\s+owners?\b|\blist\s+owners?\b', q):
+            return None
+        # Do NOT trigger if query is about a specific company's data (handled by company pipeline)
+        if re.search(r'\bthis\s+company\b', q):
+            return None
+
+        # Map common noun → collection
+        coll_signals = [
+            (["account", "accounts", "company", "companies", "client"], "companies", "companyOwner"),
+            (["contact", "contacts"], "contacts", "contactOwner"),
+            (["deal", "deals", "opportunity"], "deals", "owner"),
+            (["task", "tasks"], "createtasks", "createdBy"),
+            (["lead", "leads", "outreach"], "outreaches", "assignedTo"),
+            (["invoice", "invoices"], "invoices", "invoiceOwner"),
+            (["sales", "sales order"], "sales", "salesOwner"),
+        ]
+
+        collection, owner_field = "companies", "companyOwner"
+        for keywords, coll, field in coll_signals:
+            if any(kw in q for kw in keywords):
+                collection, owner_field = coll, field
+                break
+
+        self._log("Owner-names pipeline", f"collection={collection} field={owner_field}")
+
+        # Aggregate: group by owner field → count
+        agg_data = execute_query_plan({
+            "type": "aggregate",
+            "collection": collection,
+            "pipeline": [
+                {"$group": {"_id": f"${owner_field}", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+                {"$limit": 50},
+            ],
+        })
+
+        if not isinstance(agg_data, list) or not agg_data:
+            return None
+
+        # Resolve owner ObjectIds → user names
+        # Must use ObjectId objects for _id lookup — string IDs won't match in MongoDB
+        from bson import ObjectId as _ObjId
+        from tools.mongodb_tool import get_db as _get_db
+
+        id_to_name: Dict[str, str] = {}
+        oid_list = []
+        for row in agg_data:
+            raw = str(row.get("_id") or "")
+            if re.match(r"^[0-9a-fA-F]{24}$", raw):
+                try:
+                    oid_list.append(_ObjId(raw))
+                except Exception:
+                    pass
+
+        if oid_list:
+            try:
+                db = _get_db()
+                for u in db["users"].find({"_id": {"$in": oid_list}}, {"name": 1, "email": 1}):
+                    id_to_name[str(u["_id"])] = u.get("name") or u.get("email") or str(u["_id"])
+            except Exception as exc:
+                logger.warning(f"Owner name lookup failed: {exc}")
+
+        # Build response
+        lines = [
+            f"Found {len(agg_data)} owner(s) | Field: {owner_field} | Collection: {collection}",
+            f"Query echo -> Entity: {collection} owner | Returned: {len(agg_data)} unique owners",
+            f"Owner names for {collection}:",
+            "",
+        ]
+        for row in agg_data:
+            raw_id = str(row.get("_id", ""))
+            owner_name = id_to_name.get(raw_id) or id_to_name.get(raw_id[:24]) or raw_id[:19] + "xxxxx" if len(raw_id) >= 24 else raw_id
+            count = row.get("count", 0)
+            lines.append(f"  {owner_name}: {count} {collection}")
+
+        response = "\n".join(lines)
+        response = mask_response(response)
+        self.memory.add_exchange(user_query, response, collection=collection)
+        return self._build_result(response, start_time, format_type="list",
+                                  collection=collection)
 
     def _infer_category_field(self, collection: str, query: str) -> str:
         """

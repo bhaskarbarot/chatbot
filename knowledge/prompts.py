@@ -248,13 +248,22 @@ IMPORTANT NOTES:
 
 def build_query_prompt(user_query: str, matched_rules: list,
                        chat_context: str = "", resolved_query: str = None,
-                       format_hint: str = "auto") -> str:
+                       format_hint: str = "auto",
+                       relationship_context: str = "",
+                       sort_hint: str = "",
+                       limit_override: int = None) -> str:
     """
     Build the complete prompt for the LLM to generate a query plan.
     format_hint drives the plan type: 'table' → aggregate GROUP BY,
     'count' → count plan, 'list'/'detail' → find plan.
+    relationship_context injects FK join hints from connection.txt.
+    sort_hint / limit_override come from the query understander.
     """
     parts = [MASTER_SYSTEM_INSTRUCTION, GAP_PATCH_INSTRUCTION, SYSTEM_PROMPT]
+
+    # Inject relationship / join context from connection.txt
+    if relationship_context:
+        parts.append(f"\n{relationship_context}")
 
     # Add matched rules as context
     if matched_rules:
@@ -268,6 +277,14 @@ def build_query_prompt(user_query: str, matched_rules: list,
     # Add chat context
     if chat_context:
         parts.append(f"\nCONVERSATION CONTEXT:\n{chat_context}")
+
+    # Inject sort hint from query understander
+    if sort_hint:
+        parts.append(f"\nSORT INSTRUCTION: {sort_hint}")
+
+    # Inject explicit limit
+    if limit_override:
+        parts.append(f"\nLIMIT INSTRUCTION: User requested exactly {limit_override} records. Set limit={limit_override} in the plan.")
 
     # Inject format constraint so the LLM generates the correct plan type
     if format_hint and format_hint not in ("auto",):
