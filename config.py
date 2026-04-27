@@ -31,13 +31,13 @@ FAISS_INDEX_PATH = os.path.join(os.path.dirname(__file__), "knowledge", "faiss_i
 MAX_RESPONSE_TIME = int(os.getenv("MAX_RESPONSE_TIME", "30"))
 MAX_MONGO_RESULTS = int(os.getenv("MAX_MONGO_RESULTS", "50"))
 TOP_K_RULES = int(os.getenv("TOP_K_RULES", "5"))
-RETRIEVAL_MIN_SCORE = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.65"))
+RETRIEVAL_MIN_SCORE = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.55"))
 RETRIEVAL_MIN_MARGIN = float(os.getenv("RETRIEVAL_MIN_MARGIN", "0.06"))
 
 # ── Cache (Redis) ────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.90"))
+CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.88"))
 
 # ── Logging ──────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

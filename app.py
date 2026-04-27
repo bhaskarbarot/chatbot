@@ -119,14 +119,14 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Quick Queries**")
     for q in [
-        "Show all open deals",
-        "Total revenue this year",
+        "How many Deals are there?",
+        "Total closed won deals list",
         "Overdue invoices",
-        "Pipeline by stage",
-        "Pending tasks",
+        "Show me the top 10 customers by revenue",
+        "How many departments?",
         "Top 10 customers by revenue",
         "Deals closed this month",
-        "Target vs achieved",
+        "how many total uers?",
     ]:
         if st.button(q, key=f"q_{hash(q)}", use_container_width=True):
             st.session_state.msgs.append({"role": "user", "content": q})

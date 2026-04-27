@@ -18,10 +18,13 @@ from agents.query_planner import (
     _extract_json,
     _validate_plan_schema,
     _postprocess_plan,
+    _build_repair_prompt,
+    _build_filter_from_process,
     _normalize_extended_json,
     _contains_blocked_operator,
     _fix_dates,
 )
+from knowledge.vector_store import evaluate_match_confidence
 
 
 # ── _extract_json ─────────────────────────────────────
@@ -224,3 +227,86 @@ class TestPostprocessPlan:
         result = _postprocess_plan(plan, "get first invoice details")
         assert result.get("limit") == 1
         assert result.get("response_hint") == "detail"
+
+    def test_invoice_identifier_uses_exact_match_and_limit_1(self):
+        plan = {"type": "find", "collection": "invoices", "filter": {"invoice_number": {"$regex": "ELSN"}}}
+        result = _postprocess_plan(plan, "get invoice ELSN/2025/1 details")
+        assert result.get("limit") == 1
+        assert result["filter"]["invoice_number"] == "ELSN/2025/1"
+        assert not isinstance(result["filter"]["invoice_number"], dict)
+
+    def test_so_number_uses_exact_match_and_limit_1(self):
+        plan = {"type": "find", "collection": "sales", "filter": {}}
+        result = _postprocess_plan(plan, "show sales order number SO/2026/44")
+        assert result.get("limit") == 1
+        assert result["filter"]["sales_number"] == "SO/2026/44"
+
+    def test_contact_name_uses_exact_first_last_and_limit_1(self):
+        plan = {"type": "find", "collection": "contacts", "filter": {}}
+        result = _postprocess_plan(plan, "show contact John Doe details")
+        assert result.get("limit") == 1
+        assert result["filter"]["firstName"] == "John"
+        assert result["filter"]["lastName"] == "Doe"
+
+
+class TestRetrievalConfidence:
+    def test_high_score_gate_accepts_even_with_small_margin(self):
+        conf = evaluate_match_confidence([
+            {"final_score": 0.76},
+            {"final_score": 0.75},
+        ])
+        assert conf["is_confident"] is True
+        assert conf["gate"] == "high_score"
+
+    def test_margin_gate_accepts_moderate_score_with_clear_gap(self):
+        conf = evaluate_match_confidence([
+            {"final_score": 0.62},
+            {"final_score": 0.53},
+        ])
+        assert conf["is_confident"] is True
+        assert conf["gate"] == "margin_gate"
+
+    def test_reject_when_score_below_min(self):
+        conf = evaluate_match_confidence([
+            {"final_score": 0.54},
+            {"final_score": 0.44},
+        ])
+        assert conf["is_confident"] is False
+        assert conf["gate"] == "rejected"
+
+    def test_reject_when_margin_too_small_and_not_high_score(self):
+        conf = evaluate_match_confidence([
+            {"final_score": 0.60},
+            {"final_score": 0.57},
+        ])
+        assert conf["is_confident"] is False
+        assert conf["gate"] == "rejected"
+
+
+class TestRepairPrompt:
+    def test_projection_expression_error_forces_aggregate(self):
+        prompt = _build_repair_prompt(
+            "BASE",
+            "Find projection cannot contain aggregation expressions."
+        )
+        assert "switch to type='aggregate'" in prompt
+        assert "Do NOT return type='find'" in prompt
+
+
+class TestDateAndOverdueRules:
+    def test_fix_dates_supports_week_tokens(self):
+        result = _fix_dates({"createdAt": {"$gte": "startOfWeek", "$lte": "endOfWeek"}})
+        assert isinstance(result["createdAt"]["$gte"], str)
+        assert isinstance(result["createdAt"]["$lte"], str)
+        assert result["createdAt"]["$gte"].startswith("20")
+        assert result["createdAt"]["$lte"].startswith("20")
+
+    def test_overdue_invoice_uses_not_paid(self):
+        filt = _build_filter_from_process("overdue invoices", {}, "invoices", "overdue invoices")
+        assert filt["due_date"]["$lt"] == "today"
+        assert filt["payment_status"]["$ne"] == "paid"
+
+    def test_overdue_tasks_excludes_completed(self):
+        filt = _build_filter_from_process("overdue tasks", {}, "createtasks", "overdue tasks")
+        assert filt["due_date"]["$lt"] == "today"
+        assert "Completed" in filt["status"]["$nin"]

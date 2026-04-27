@@ -216,6 +216,34 @@ def execute_query_plan(plan: Dict) -> Any:
         return []
 
 
+# Date fields — $regex is never valid on these; convert to $exists
+_DATE_FIELDS = frozenset({
+    "createdAt", "updatedAt", "due_date", "invoice_date", "dealWonAt",
+    "dealLostAt", "closeDate", "sales_date", "start", "end", "billDate",
+    "dueDate", "leadWonAt", "leadLostAt", "lastBusinessDate", "inActiveSince",
+    "birthday", "lastLogin", "ReminderDate", "closedDate", "convertedDate",
+    "interestedDate", "date_created", "closing_date",
+})
+
+
+def _fix_date_regex(obj: Any) -> Any:
+    """Replace $regex on date fields with {$exists: true} to prevent query errors."""
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if k in _DATE_FIELDS and isinstance(v, dict) and "$regex" in v:
+                logger.warning(f"Replacing invalid $regex on date field '{k}' with $exists")
+                result[k] = {"$exists": True}
+            elif isinstance(v, (dict, list)):
+                result[k] = _fix_date_regex(v)
+            else:
+                result[k] = v
+        return result
+    if isinstance(obj, list):
+        return [_fix_date_regex(item) for item in obj]
+    return obj
+
+
 def _sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize malformed planner outputs into executable shape."""
     out = dict(plan)
@@ -236,7 +264,7 @@ def _sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
                         filt.pop("$limit", None)
                 else:
                     filt.pop(bad_key, None)
-        out["filter"] = filt
+        out["filter"] = _fix_date_regex(filt)
         if "sort" in out:
             out["sort"] = _normalize_sort_spec(out.get("sort"))
     elif qtype == "aggregate" and isinstance(out.get("pipeline"), list):
@@ -247,9 +275,14 @@ def _sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
             op, payload = next(iter(stage.items()))
             if op == "$sort":
                 fixed_pipeline.append({"$sort": _normalize_sort_object(payload)})
+            elif op == "$match":
+                fixed_pipeline.append({"$match": _fix_date_regex(payload)})
             else:
                 fixed_pipeline.append({op: payload})
         out["pipeline"] = fixed_pipeline
+    elif qtype == "count":
+        filt = out.get("filter") or {}
+        out["filter"] = _fix_date_regex(filt)
     return out
 
 

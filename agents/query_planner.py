@@ -176,10 +176,21 @@ def _generate_and_validate_plan_safe(
 
 def _build_repair_prompt(base_prompt: str, validation_error: str) -> str:
     """Prompt used when first model output is invalid."""
+    error_text = (validation_error or "").strip()
+    force_aggregate = "Find projection cannot contain aggregation expressions" in error_text
+    extra = ""
+    if force_aggregate:
+        extra = (
+            "\nMANDATORY FIX:\n"
+            "- The previous plan incorrectly used type='find' with aggregation expressions in projection.\n"
+            "- IMMEDIATELY switch to type='aggregate' and move expression logic into a valid pipeline.\n"
+            "- Do NOT return type='find' in this retry.\n"
+        )
     return (
         f"{base_prompt}\n\n"
         "Your previous response was invalid.\n"
-        f"Validation error: {validation_error}\n\n"
+        f"Validation error: {error_text}\n"
+        f"{extra}\n"
         "Return ONLY a corrected JSON object with no extra text."
     )
 
@@ -359,7 +370,130 @@ def _postprocess_plan(plan: Dict, user_query: str) -> Dict:
         from utils.formatter import detect_format_intent
         plan["response_hint"] = detect_format_intent(user_query)
 
+    plan = _enforce_exact_entity_lookup(plan, user_query)
+
     return plan
+
+
+def _enforce_exact_entity_lookup(plan: Dict[str, Any], user_query: str) -> Dict[str, Any]:
+    """
+    Enforce exact-equality lookup for specific entity identifiers.
+    Applies to find/count plans with concrete invoice/deal/SO/contact/user identifiers.
+    """
+    out = dict(plan or {})
+    if out.get("type") not in {"find", "count"}:
+        return out
+
+    collection = str(out.get("collection", "")).strip()
+    if not collection:
+        return out
+
+    filter_dict = out.get("filter") if isinstance(out.get("filter"), dict) else {}
+    q = user_query or ""
+    q_lower = q.lower()
+
+    invoice_no = _extract_invoice_number(q)
+    so_no = _extract_sales_order_number(q)
+    deal_name = _extract_entity_name_from_query(q, {"deal"})
+    contact_name = _extract_entity_name_from_query(q, {"contact", "person"})
+    user_name = _extract_entity_name_from_query(q, {"user", "owner", "rep"})
+
+    if collection == "invoices" and invoice_no:
+        filter_dict.pop("invoice_number", None)
+        filter_dict["invoice_number"] = invoice_no
+        out["limit"] = 1
+        return _strip_regex_for_exact_fields(out, {"invoice_number"})
+
+    if collection == "sales" and so_no:
+        filter_dict.pop("sales_number", None)
+        filter_dict["sales_number"] = so_no
+        out["limit"] = 1
+        return _strip_regex_for_exact_fields(out, {"sales_number"})
+
+    if collection == "deals" and deal_name:
+        filter_dict.pop("name", None)
+        filter_dict["name"] = deal_name
+        out["limit"] = 1
+        return _strip_regex_for_exact_fields(out, {"name"})
+
+    if collection == "users" and user_name:
+        filter_dict.pop("name", None)
+        filter_dict["name"] = user_name
+        out["limit"] = 1
+        return _strip_regex_for_exact_fields(out, {"name"})
+
+    if collection == "contacts" and contact_name:
+        parts = [p for p in contact_name.split() if p]
+        if len(parts) >= 2:
+            filter_dict.pop("firstName", None)
+            filter_dict.pop("lastName", None)
+            filter_dict["firstName"] = parts[0]
+            filter_dict["lastName"] = " ".join(parts[1:])
+            out["limit"] = 1
+            out["filter"] = filter_dict
+            return _strip_regex_for_exact_fields(out, {"firstName", "lastName"})
+        # Single-token contact lookup still exact, no regex.
+        filter_dict["$or"] = [{"firstName": contact_name}, {"lastName": contact_name}]
+        out["limit"] = 1
+        out["filter"] = filter_dict
+        return _strip_regex_for_exact_fields(out, {"firstName", "lastName"})
+
+    out["filter"] = filter_dict
+    return out
+
+
+def _extract_invoice_number(query: str) -> Optional[str]:
+    # Matches invoice-like IDs including slashes/hyphens, e.g. ELSN/2025/1
+    m = re.search(r"\b([A-Z]{2,}[A-Z0-9]*[/-]\d{2,4}[/-]\d+)\b", query, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def _extract_sales_order_number(query: str) -> Optional[str]:
+    m = re.search(
+        r"\b(?:so|sales\s*order)\s*(?:number|no|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9/_-]{2,})\b",
+        query,
+        re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else None
+
+
+def _extract_entity_name_from_query(query: str, entity_words: set[str]) -> Optional[str]:
+    qw = "|".join(re.escape(w) for w in sorted(entity_words, key=len, reverse=True))
+    patterns = [
+        rf"\b(?:for|of|named|name is)\s+([A-Za-z][A-Za-z0-9 .&'_-]{{1,80}}?)\s+(?:{qw})\b",
+        rf"\b(?:{qw})\s+(?:named|name is)\s+([A-Za-z][A-Za-z0-9 .&'_-]{{1,80}})\b",
+        rf"\b(?:{qw})\s+([A-Za-z][A-Za-z0-9 .&'_-]{{1,80}})\b",
+    ]
+    for p in patterns:
+        m = re.search(p, query, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().strip(".,")
+            candidate = re.sub(r"\b(details?|summary|record|records)\b.*$", "", candidate, flags=re.IGNORECASE).strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _strip_regex_for_exact_fields(plan: Dict[str, Any], fields: set[str]) -> Dict[str, Any]:
+    out = dict(plan)
+    filt = out.get("filter") if isinstance(out.get("filter"), dict) else {}
+    for field in fields:
+        val = filt.get(field)
+        if isinstance(val, dict) and "$regex" in val:
+            filt[field] = val.get("$regex")
+    # Clean regex from simple OR conditions for these fields.
+    if isinstance(filt.get("$or"), list):
+        new_or = []
+        for cond in filt["$or"]:
+            if isinstance(cond, dict) and len(cond) == 1:
+                key = next(iter(cond.keys()))
+                if key in fields and isinstance(cond[key], dict) and "$regex" in cond[key]:
+                    new_or.append({key: cond[key]["$regex"]})
+                    continue
+            new_or.append(cond)
+        filt["$or"] = new_or
+    out["filter"] = filt
+    return out
 
 
 def _validate_plan_schema(plan: Dict) -> Optional[str]:
@@ -486,6 +620,11 @@ def _fix_dates(obj: Any) -> Any:
     if isinstance(obj, str):
         # Check for date-like patterns
         date_patterns = [
+            (r'startOfWeek', lambda: (datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                                      - timedelta(days=datetime.now().weekday())).isoformat()),
+            (r'endOfWeek', lambda: ((datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                                     - timedelta(days=datetime.now().weekday()))
+                                    + timedelta(days=6, hours=23, minutes=59, seconds=59)).isoformat()),
             (r'startOfMonth', lambda: datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()),
             (r'endOfMonth', lambda: ((datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0) + timedelta(days=32)).replace(day=1, hour=0, minute=0, second=0, microsecond=0) - timedelta(microseconds=1)).isoformat()),
             (r'startOfYear', lambda: datetime.now().replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()),
@@ -515,24 +654,26 @@ def _extract_params(query: str, param_names: list,
     for param in param_names:
         p_lower = param.lower()
         if p_lower in ("name", "company", "account name"):
-            # Try to extract a name after common prepositions
+            # Capture FULL name including hyphens, commas, ampersands — never truncate
             name_match = re.search(
-                r'(?:for|of|about|named?|company|account)\s+["\']?([A-Za-z][\w\s]+?)["\']?(?:\s*$|\s+(?:and|or|with|from|in))',
+                r'(?:for|of|about|named?|company|account)\s+["\']?([\w][\w\s\-&.,]{1,120}?)["\']?'
+                r'(?:\s*$|\s+\b(?:and|or|with|from|in|give|show|get|please)\b)',
                 q, re.IGNORECASE
             )
             if name_match:
-                params[param] = name_match.group(1).strip()
+                params[param] = name_match.group(1).strip().rstrip(".,;")
         elif p_lower in ("date", "start date", "end date"):
             date_match = re.search(r'(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})', q)
             if date_match:
                 params[param] = date_match.group(1)
         elif p_lower in ("user", "owner", "rep"):
+            # Capture full user name with hyphens/spaces
             name_match = re.search(
-                r'(?:user|owner|rep|for|by)\s+["\']?([A-Z][\w\s]+?)["\']?(?:\s*$|\s+)',
+                r'(?:user|owner|rep|for|by)\s+["\']?([\w][\w\s\-&.,]{1,80}?)["\']?(?:\s*$|\s+\b)',
                 q, re.IGNORECASE
             )
             if name_match:
-                params[param] = name_match.group(1).strip()
+                params[param] = name_match.group(1).strip().rstrip(".,;")
 
     return params
 
@@ -562,11 +703,12 @@ def _build_filter_from_process(process: str, params: Dict,
     if "past due" in lower or "overdue" in lower:
         filter_dict.setdefault("due_date", {"$lt": "today"})
         if collection == "invoices":
-            filter_dict.setdefault("payment_status", {"$in": ["draft", "confirmed", "partial_payment"]})
+            filter_dict.setdefault("payment_status", {"$ne": "paid"})
         if collection == "createtasks":
-            filter_dict.setdefault("status", {"$in": ["Pending", "pending", "Open", "open"]})
+            filter_dict.setdefault("status", {"$nin": ["Completed", "completed"]})
     if "this week" in lower:
         filter_dict.setdefault("createdAt", {"$gte": "startOfWeek"})
+        filter_dict["createdAt"]["$lte"] = "endOfWeek"
     if "this month" in lower:
         filter_dict.setdefault("createdAt", {"$gte": "startOfMonth"})
     if "this year" in lower or "financial year" in lower:

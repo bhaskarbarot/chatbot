@@ -1,0 +1,179 @@
+# ECRM Collection Connections (from models/*.js)
+# Format:
+# source_collection.source_field -> target_collection._id  (ref model)
+#
+# Note:
+# - Collection names follow your project mapping used in metadata/routes.
+# - Some refs in schema use model names; lines below map them to runtime collections.
+
+============================================================
+1) CORE CRM RELATIONS
+============================================================
+
+companies.companyOwner -> users._id (User)
+companies.createdBy -> users._id (User)
+companies.region -> regions._id (Region)
+companies.webTechnologies[] -> technologies._id (Technology)
+companies.source -> sources._id (Source)
+companies.wonByCompanyOwner -> users._id (User)
+companies.inActiveBy -> users._id (User)
+
+contacts.contactOwner -> users._id (User)
+contacts.company -> companies._id (Company)
+contacts.source -> sources._id (Source)
+contacts.createdBy -> users._id (User)
+
+deals.owner -> users._id (User)
+deals.createdByOwner -> users._id (User)
+deals.contact -> contacts._id (Contact)
+deals.company -> companies._id (Company)
+deals.business_analyst -> users._id (User)
+deals.project_type -> projecttypes._id (ProjectType)
+deals.lineItems[].product -> products._id (products)
+deals.lineItems[].project_type -> projecttypes._id (ProjectType)
+
+sales.salesOwner -> users._id (User)
+sales.company -> companies._id (Company)
+sales.createdByCompanyOwner -> users._id (User)
+sales.items[].product -> products._id (products)
+sales.items[].project_type -> projecttypes._id (ProjectType)
+
+invoices.company -> companies._id (Company)
+invoices.so_number -> sales._id (Sales)
+invoices.createdBy -> users._id (User)
+invoices.createdByCompanyOwner -> users._id (User)
+invoices.invoiceOwner -> users._id (User)
+invoices.sales_person -> users._id (User)
+invoices.items[].product -> products._id (products)
+invoices.items[].project_type -> projecttypes._id (ProjectType)
+invoices.payment_history[].payment_by -> users._id (User)
+
+============================================================
+2) TASKS / NOTES / NOTIFICATIONS
+============================================================
+
+createtasks.createdBy -> users._id (User)
+createtasks.companyId -> companies._id (Company)
+createtasks.company -> companies._id (Company)
+createtasks.contectId -> contacts._id (Contact)
+createtasks.dealsId -> deals._id (Deal)
+createtasks.invoiceId -> invoices._id (Invoice)
+createtasks.salesId -> sales._id (Sales)
+
+companynotes.company -> companies._id (Company)
+companynotes.createdBy -> users._id (User)
+
+contactsnotes.contact_id -> contacts._id (Contact)
+contactsnotes.createdBy -> users._id (User)
+
+dealsnotes.deals -> deals._id (Deal)
+dealsnotes.createdBy -> users._id (User)
+
+salesnotes.sales -> sales._id (Sales)
+salesnotes.createdBy -> users._id (User)
+
+commonnotes.createdBy -> users._id (User)
+commonnotes.companyId -> companies._id (Company)
+commonnotes.dealId -> deals._id (Deal)
+commonnotes.taskId -> tasks._id (Task)
+commonnotes.contactId -> contacts._id (Contact)
+commonnotes.salesId -> sales._id (Sales)
+commonnotes.invoiceId -> invoices._id (Invoice)
+commonnotes.mentionedUsers[].user -> users._id (User)
+
+notifications.receivers[] -> users._id (User)
+notifications.outreachId -> outreaches._id (OutReach)
+notifications.taskId -> createtasks._id (CreateTask)
+notifications.contactId -> contacts._id (Contact)
+notifications.readBy[] -> users._id (User)
+
+============================================================
+3) OUTREACH / CAMPAIGN / ACTIVITY
+============================================================
+
+outreaches.campaign -> campaigns._id (Campaign)
+outreaches.region -> regions._id (Region)
+outreaches.assignedTo -> users._id (User)
+outreaches.createdBy -> users._id (User)
+
+notes.outreach -> outreaches._id (OutReach)
+notes.createdBy -> users._id (User)
+
+bademails.originalOutReachId -> outreaches._id (OutReach)
+
+outreachactivities.ActivityId -> activityevents._id (ActivityEvent)
+outreachactivities.regionId -> regions._id (Region)
+outreachactivities.createdBy -> users._id (User)
+
+activityevents.createdBy -> users._id (User)
+
+campaigns.categoryId -> categorys._id (Category)
+campaigns.createdBy -> users._id (User)
+
+============================================================
+4) USER / ORG / MASTERS
+============================================================
+
+users.department -> departments._id (departments)
+users.regionId -> regions._id (Region)
+users.regions[] -> regions._id (Region)
+users.reporting_manager -> users._id (User)
+
+targets.userId -> users._id (User)
+targets.createdBy -> users._id (User)
+targets.updatedBy -> users._id (User)
+
+technologies.category -> technologycategories._id (TechnologyCategory)
+products.product_type -> projecttypes._id (ProjectType)
+products.technology[] -> technologies._id (Technology)
+
+vendors.technology[] -> technologies._id (Technology)
+vendors.createdBy -> users._id (User)
+
+taxes.createdBy -> users._id (User)
+dealstagesettings.lastUpdatedBy -> users._id (User)
+dealstagesettings.createdBy -> users._id (User)
+
+============================================================
+5) BILLING / OTHER MODULES
+============================================================
+
+bills.vendor -> vendors._id (Vendor)
+bills.createdBy -> users._id (User)
+
+remotejobs.region -> regions._id (Region)
+remotejobs.assignedTo -> users._id (User)
+remotejobs.createdBy -> users._id (User)
+
+remotejobnotes.remoteJobId -> remotejobs._id (RemoteJob)
+remotejobnotes.createdBy -> users._id (User)
+
+emails.user -> users._id (User)
+meetings.createdBy -> users._id (User)
+
+============================================================
+6) QUICK PATH CHAINS (for multi-table responses)
+============================================================
+
+sales -> invoices:
+sales._id -> invoices.so_number
+
+company-centric path:
+companies._id -> contacts.company
+companies._id -> deals.company
+companies._id -> sales.company
+companies._id -> invoices.company
+
+owner path:
+users._id -> companies.companyOwner
+users._id -> contacts.contactOwner
+users._id -> deals.owner
+users._id -> sales.salesOwner
+users._id -> invoices.sales_person / invoiceOwner
+
+task linkage path:
+createtasks.dealsId -> deals._id
+createtasks.companyId -> companies._id
+createtasks.contectId -> contacts._id
+createtasks.invoiceId -> invoices._id
+createtasks.salesId -> sales._id

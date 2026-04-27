@@ -112,15 +112,16 @@ def format_value(key: str, val: Any) -> str:
     return str(val)
 
 
-def format_as_summary(data: List[Dict], query: str, total_count: int = None) -> str:
+def format_as_summary(data: List[Dict], query: str, total_count: int = None,
+                      response_meta: Optional[Dict[str, Any]] = None) -> str:
     """Format data as executive summary + key details."""
     if not data:
-        lines = _executive_summary_lines([], query)
+        lines = _executive_summary_lines([], query, response_meta=response_meta)
         lines.append("No matching records found for your query.")
         return "\n".join(lines)
 
     count = total_count or len(data)
-    lines = _executive_summary_lines(data, query)
+    lines = _executive_summary_lines(data, query, response_meta=response_meta)
 
     if count == 1:
         lines.append(_format_single_record(mask_dict(data[0])))
@@ -133,14 +134,15 @@ def format_as_summary(data: List[Dict], query: str, total_count: int = None) -> 
     return "\n".join(lines)
 
 
-def format_as_list(data: List[Dict], query: str) -> str:
+def format_as_list(data: List[Dict], query: str,
+                   response_meta: Optional[Dict[str, Any]] = None) -> str:
     """Format data as a numbered list with executive summary."""
     if not data:
-        lines = _executive_summary_lines([], query)
+        lines = _executive_summary_lines([], query, response_meta=response_meta)
         lines.append("No results found for your query.")
         return "\n".join(lines)
 
-    lines = _executive_summary_lines(data, query)
+    lines = _executive_summary_lines(data, query, response_meta=response_meta)
     lines.append(f"Found {len(data)} result(s):\n")
     for i, record in enumerate(data, 1):
         lines.append(_format_list_item(mask_dict(record) if isinstance(record, dict) else record, i))
@@ -148,14 +150,15 @@ def format_as_list(data: List[Dict], query: str) -> str:
     return "\n".join(lines)
 
 
-def format_as_table(data: List[Dict], query: str) -> str:
+def format_as_table(data: List[Dict], query: str,
+                    response_meta: Optional[Dict[str, Any]] = None) -> str:
     """Format data as a markdown table with executive summary."""
     if not data:
-        lines = _executive_summary_lines([], query)
+        lines = _executive_summary_lines([], query, response_meta=response_meta)
         lines.append("No results found for your query.")
         return "\n".join(lines)
 
-    summary = "\n".join(_executive_summary_lines(data, query))
+    summary = "\n".join(_executive_summary_lines(data, query, response_meta=response_meta))
 
     priority_keys = ["name", "companyName", "firstName", "lastName",
                      "invoice_number", "sales_number", "deal_number",
@@ -187,7 +190,8 @@ def format_as_table(data: List[Dict], query: str) -> str:
     return result
 
 
-def format_as_count(data: Any, query: str) -> str:
+def format_as_count(data: Any, query: str,
+                    response_meta: Optional[Dict[str, Any]] = None) -> str:
     """Format as a count response with executive summary."""
     if isinstance(data, (int, float)):
         count = int(data)
@@ -203,19 +207,20 @@ def format_as_count(data: Any, query: str) -> str:
     else:
         count = data
 
-    lines = _executive_summary_lines(count, query)
+    lines = _executive_summary_lines(count, query, response_meta=response_meta)
     lines.append(f"Total Count: **{count}**")
     return "\n".join(lines)
 
 
-def format_as_detail(data: List[Dict], query: str) -> str:
+def format_as_detail(data: List[Dict], query: str,
+                     response_meta: Optional[Dict[str, Any]] = None) -> str:
     """Format full details for a single or few records."""
     if not data:
-        lines = _executive_summary_lines([], query)
+        lines = _executive_summary_lines([], query, response_meta=response_meta)
         lines.append("No results found for your query.")
         return "\n".join(lines)
 
-    lines = _executive_summary_lines(data, query)
+    lines = _executive_summary_lines(data, query, response_meta=response_meta)
     for i, record in enumerate(data[:5]):
         masked = mask_dict(record) if isinstance(record, dict) else record
         if i > 0:
@@ -228,12 +233,13 @@ def format_as_detail(data: List[Dict], query: str) -> str:
     return "\n".join(lines)
 
 
-def format_aggregation(data: List[Dict], query: str) -> str:
+def format_aggregation(data: List[Dict], query: str,
+                       response_meta: Optional[Dict[str, Any]] = None) -> str:
     """Format aggregation results as a markdown table with executive summary."""
     if not data:
         return "No aggregation results found."
 
-    lines = _executive_summary_lines(data, query)
+    lines = _executive_summary_lines(data, query, response_meta=response_meta)
 
     if data and isinstance(data[0], dict):
         keys = list(data[0].keys())
@@ -249,25 +255,26 @@ def format_aggregation(data: List[Dict], query: str) -> str:
     return "\n".join(lines)
 
 
-def auto_format(data: Any, query: str, format_hint: str = "auto") -> str:
+def auto_format(data: Any, query: str, format_hint: str = "auto",
+                response_meta: Optional[Dict[str, Any]] = None) -> str:
     """Automatically choose and apply the best format."""
     if format_hint == "auto":
         format_hint = detect_format_intent(query)
 
     if isinstance(data, (int, float)):
-        return format_as_count(data, query)
+        return format_as_count(data, query, response_meta=response_meta)
 
     if isinstance(data, dict):
         if any(k in data for k in ["count", "total", "total_revenue_usd",
                                     "totalRevenue", "invoice_count"]):
-            return format_as_count(data, query)
+            return format_as_count(data, query, response_meta=response_meta)
         data = [data]
 
     if not isinstance(data, list):
         return str(data)
 
     if len(data) == 0:
-        lines = _executive_summary_lines([], query)
+        lines = _executive_summary_lines([], query, response_meta=response_meta)
         lines.append("No results found for your query.")
         return "\n".join(lines)
 
@@ -280,30 +287,31 @@ def auto_format(data: Any, query: str, format_hint: str = "auto") -> str:
         and not any(k in data[0] for k in {"createdAt", "updatedAt", "email", "phoneNumber"})
     )
     if is_aggregation:
-        return format_aggregation(data, query)
+        return format_aggregation(data, query, response_meta=response_meta)
 
     masked_data = [mask_dict(r) if isinstance(r, dict) else r for r in data]
 
     if format_hint == "count":
-        return format_as_count(len(masked_data), query)
+        return format_as_count(len(masked_data), query, response_meta=response_meta)
     elif format_hint == "table":
-        return format_as_table(masked_data, query)
+        return format_as_table(masked_data, query, response_meta=response_meta)
     elif format_hint == "list":
-        return format_as_list(masked_data, query)
+        return format_as_list(masked_data, query, response_meta=response_meta)
     elif format_hint == "detail":
-        return format_as_detail(masked_data, query)
+        return format_as_detail(masked_data, query, response_meta=response_meta)
     elif format_hint == "summary":
-        return format_as_summary(masked_data, query)
+        return format_as_summary(masked_data, query, response_meta=response_meta)
     else:
         if len(masked_data) <= 5:
-            return format_as_summary(masked_data, query)
+            return format_as_summary(masked_data, query, response_meta=response_meta)
         else:
-            return format_as_list(masked_data, query)
+            return format_as_list(masked_data, query, response_meta=response_meta)
 
 
 # ── Executive Summary ────────────────────────────────
 
-def _executive_summary_lines(data: Any, query: str) -> List[str]:
+def _executive_summary_lines(data: Any, query: str,
+                             response_meta: Optional[Dict[str, Any]] = None) -> List[str]:
     """
     Generate 3-line executive summary at top of every response.
     Line 1: Direct answer with count/value
@@ -312,27 +320,49 @@ def _executive_summary_lines(data: Any, query: str) -> List[str]:
     """
     q = query.lower()
     entity = _detect_entity_type_from_query(q)
+    meta = response_meta or {}
+    explicit_entity = str(meta.get("entity") or "").strip()
+    explicit_collection = str(meta.get("collection") or "").strip()
+    if explicit_entity:
+        entity = explicit_entity
+
+    returned_count = _resolve_returned_count(data)
+    echo_filter = _render_filter_for_echo(
+        meta.get("filter"),
+        query=query,
+    )
+    echo_collection = explicit_collection or _infer_collection_from_entity(entity)
+    echo_line_1 = (
+        f"Found {returned_count} {entity} record(s) | "
+        f"Filter: {echo_filter} | "
+        f"Collection: {echo_collection}"
+    )
+    echo_line_2 = (
+        f"Query echo -> Entity: {entity} | "
+        f"Filter: {echo_filter} | "
+        f"Returned: {returned_count} records"
+    )
 
     # Handle numeric count
     if isinstance(data, (int, float)):
         count = int(data)
         if count == 0:
-            line1 = f"Answer: No {entity} records found matching your criteria."
+            line1 = f"Answer: No {entity} records found for the applied filters."
             line2 = _get_no_data_explanation(q)
             line3 = "Try adjusting filters, date range, or search terms."
         else:
-            line1 = f"Answer: Found {count} {entity} record(s) matching your query."
-            line2 = f"This is the total count from the ECRM {entity} module, filtered per your request."
+            line1 = f"Answer: Found {count} {entity} record(s) for the applied filters."
+            line2 = f"This is the total count from the ECRM {entity} module."
             line3 = "Ask for a breakdown by status, stage, or owner for more detailed insights."
-        return [line1, line2, line3, ""]
+        return [echo_line_1, echo_line_2, line1, line2, line3, ""]
 
     count = len(data) if isinstance(data, list) else 1
 
     if count == 0:
-        line1 = f"No {entity} records found matching your query."
+        line1 = f"No {entity} records found for the applied filters."
         line2 = _get_no_data_explanation(q)
         line3 = "Try broadening your search, adjusting date range, or checking spelling."
-        return [line1, line2, line3, ""]
+        return [echo_line_1, echo_line_2, line1, line2, line3, ""]
 
     total_val = _extract_total_value(data) if isinstance(data, list) else None
     key_stat = _extract_key_stat(data, q) if isinstance(data, list) and data else ""
@@ -364,19 +394,19 @@ def _executive_summary_lines(data: Any, query: str) -> List[str]:
     elif "this year" in q or "financial year" in q:
         line1 = f"Summary: {count} {entity} record(s) found for this financial year."
     else:
-        line1 = f"Summary: Found {count} {entity} record(s) matching your query."
+        line1 = f"Summary: Found {count} {entity} record(s) for the applied filters."
 
     # Line 2: Context or key insight
     if key_stat:
         line2 = key_stat
     elif "stage" in q or "status" in q:
-        line2 = f"Results are filtered by the requested stage/status from the ECRM {entity} module."
+        line2 = f"Stage/status constraints were applied on the ECRM {entity} module."
     elif "owner" in q or "rep" in q or "user" in q:
-        line2 = f"Results are filtered by the requested user/owner from the ECRM system."
+        line2 = f"User/owner constraints were applied from the ECRM system."
     elif "this month" in q or "last month" in q or "this year" in q:
-        line2 = f"Data is time-filtered per your request from the ECRM {entity} module."
+        line2 = f"Date-window constraints were applied from the ECRM {entity} module."
     else:
-        line2 = f"Results from the ECRM {entity} module, filtered as per your request."
+        line2 = f"Records are returned from the ECRM {entity} module with applied constraints."
 
     # Line 3: Action hint
     if count > 20:
@@ -386,7 +416,196 @@ def _executive_summary_lines(data: Any, query: str) -> List[str]:
     else:
         line3 = "Try adjusting your search criteria or date range for more results."
 
-    return [line1, line2, line3, ""]
+    return [echo_line_1, echo_line_2, line1, line2, line3, ""]
+
+
+def _resolve_returned_count(data: Any) -> int:
+    if isinstance(data, (int, float)):
+        return int(data)
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        if "count" in data and isinstance(data["count"], (int, float)):
+            return int(data["count"])
+        if "total" in data and isinstance(data["total"], (int, float)):
+            return int(data["total"])
+        return 1 if data else 0
+    return 0
+
+
+_SOFT_DELETE_FIELDS = {"deleted", "isDeleted", "__v", "deletedAt"}
+
+
+def _render_filter_for_echo(filter_obj: Any, query: str = "") -> str:
+    """
+    Build a human-readable filter string for the echo line.
+    Strips soft-delete noise; falls back to query-text extraction when
+    the plan filter has no meaningful conditions.
+    """
+    clean: Dict = {}
+    if isinstance(filter_obj, dict):
+        for k, v in filter_obj.items():
+            if k not in _SOFT_DELETE_FIELDS:
+                clean[k] = v
+
+    if clean:
+        fragments = _flatten_filter_fragments(clean)
+        if fragments:
+            return " AND ".join(fragments[:6])
+        try:
+            return json.dumps(clean, default=str)[:280]
+        except Exception:
+            return str(clean)[:280]
+
+    # No meaningful plan filter — extract from query text
+    return _extract_filter_hint_from_query(query)
+
+
+def _extract_filter_hint_from_query(query: str) -> str:
+    """
+    When the executed plan had no filter beyond soft-delete, build a
+    filter description from the query text so the echo line is never blank.
+    If the query genuinely has no filter (e.g. 'Get all deals'), return 'none'.
+    """
+    q = query.strip()
+    ql = q.lower()
+
+    # Entity name after trigger phrases — capture FULL name including hyphens/commas
+    for trigger in ["linked to", "associated with", "history for", "details for",
+                    "details of", " for ", " of "]:
+        idx = ql.find(trigger)
+        if idx != -1:
+            name = q[idx + len(trigger):].strip()
+            # Remove trailing common suffixes
+            name = re.sub(
+                r'\s+\b(give|show|and|with|in|from|using|please|including)\b.*$',
+                '', name, flags=re.IGNORECASE
+            ).strip().rstrip(".,;")
+            if 2 < len(name) <= 120:
+                return f"name contains '{name}'"
+
+    # Explicit field=value patterns
+    checks = [
+        (r'\bpriority\s+([A-Za-z]+)', "priority"),
+        (r'\bwith\s+priority\s+([A-Za-z]+)', "priority"),
+        (r'\bstatus\s+([A-Za-z_]+)', "status"),
+        (r'\bwith\s+status\s+([A-Za-z_]+)', "status"),
+        (r'\bby\s+region\s+([A-Za-z]+)', "region"),
+        (r'\bregion\s+([A-Za-z]+)', "region"),
+        (r'\bby\s+source\s+([\w/]+)', "source"),
+        (r'\bsource\s+([\w/]+)', "source"),
+        (r'\btechnology\s+([\w]+)', "technology"),
+        (r'\bjob\s+title\s+([\w\s]+)', "jobTitle"),
+        (r'\bby\s+country\s+([A-Za-z]+)', "country"),
+    ]
+    for pat, field in checks:
+        m = re.search(pat, ql)
+        if m:
+            return f"{field} = '{m.group(1)}'"
+
+    # Date / temporal
+    if "today" in ql:
+        return "date = today"
+    if "this week" in ql:
+        return "date within this week"
+    if "this month" in ql:
+        return "date within this month"
+    if "last month" in ql:
+        return "date within last month"
+    if "this year" in ql or "financial year" in ql or "fy" in ql:
+        return "date within this financial year"
+    m_rel = re.search(r"last\s+(\d+)\s+(day|week|month|year)s?", ql)
+    if m_rel:
+        return f"date within last {m_rel.group(1)} {m_rel.group(2)}(s)"
+    m_date = re.search(r'(?:after|before|on|due)\s+(\d{4}-\d{2}-\d{2})', ql)
+    if m_date:
+        direction = "after" if "after" in ql else "before" if "before" in ql else "on"
+        return f"date {direction} {m_date.group(1)}"
+    m_range = re.search(r'(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})', ql)
+    if m_range:
+        return f"date between {m_range.group(1)} and {m_range.group(2)}"
+    m_amt = re.search(r'amount\s+(?:range\s+)?(\d+)\s+to\s+(\d+)', ql)
+    if m_amt:
+        return f"amount between {m_amt.group(1)} and {m_amt.group(2)}"
+
+    # Overdue / pending / status keywords
+    if "overdue" in ql:
+        return "due_date < today AND status != paid"
+    if "pending" in ql:
+        return "status = 'pending/open'"
+    if "closed won" in ql:
+        return "dealWonAt != null AND dealLostAt = null"
+    if "closed lost" in ql:
+        return "dealLostAt != null"
+    if "paid" in ql:
+        return "payment_status = 'paid'"
+    if "draft" in ql:
+        return "status = 'Draft'"
+    if "cancelled" in ql:
+        return "status = 'Cancelled'"
+    if "confirmed" in ql or "confirm" in ql:
+        return "status = 'Confirm'"
+
+    return "none"
+
+
+def _flatten_filter_fragments(filter_obj: Any, prefix: str = "") -> List[str]:
+    fragments: List[str] = []
+    if isinstance(filter_obj, dict):
+        for key, value in filter_obj.items():
+            if key in {"$and", "$or"} and isinstance(value, list):
+                nested: List[str] = []
+                for part in value:
+                    nested.extend(_flatten_filter_fragments(part))
+                if nested:
+                    joiner = f" {key[1:].upper()} "
+                    fragments.append(f"({joiner.join(nested[:4])})")
+                continue
+            if isinstance(value, dict):
+                ops: List[str] = []
+                for op, op_val in value.items():
+                    if op == "$regex":
+                        ops.append(f"{key} contains '{op_val}'")
+                    elif op == "$in" and isinstance(op_val, list):
+                        vals = ", ".join(f"'{x}'" for x in op_val[:5])
+                        ops.append(f"{key} in [{vals}]")
+                    elif op in {"$gte", "$gt", "$lte", "$lt", "$ne", "$eq"}:
+                        sym = {
+                            "$gte": ">=",
+                            "$gt": ">",
+                            "$lte": "<=",
+                            "$lt": "<",
+                            "$ne": "!=",
+                            "$eq": "=",
+                        }[op]
+                        ops.append(f"{key} {sym} '{op_val}'")
+                    elif op == "$options":
+                        continue
+                    else:
+                        ops.append(f"{key}.{op}='{op_val}'")
+                if ops:
+                    fragments.append(" and ".join(ops))
+            else:
+                fragments.append(f"{key} = '{value}'")
+    return fragments
+
+
+def _infer_collection_from_entity(entity: str) -> str:
+    ent = (entity or "").strip().lower()
+    mapping = {
+        "deal": "deals",
+        "invoice": "invoices",
+        "company": "companies",
+        "contact": "contacts",
+        "task": "createtasks",
+        "user": "users",
+        "lead": "outreaches",
+        "target": "targets",
+        "sales": "sales",
+        "bill": "bills",
+        "product": "products",
+    }
+    return mapping.get(ent, ent + "s" if ent else "unknown")
 
 
 # ── Internal helpers ─────────────────────────────────

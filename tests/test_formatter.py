@@ -163,10 +163,12 @@ class TestAutoFormat:
 # ── _executive_summary_lines ──────────────────────────
 
 class TestExecutiveSummaryLines:
-    def test_count_data_produces_3_plus_blank_lines(self):
+    def test_count_data_produces_echo_plus_summary_lines(self):
         lines = _executive_summary_lines(5, "how many deals")
-        assert len(lines) == 4  # 3 lines + empty
+        assert len(lines) >= 6  # 2 mandatory echo lines + 3 summary lines + blank
         assert "5" in lines[0]
+        assert "Filter:" in lines[0]
+        assert "Collection:" in lines[0]
 
     def test_empty_list_produces_no_results_line(self):
         lines = _executive_summary_lines([], "show deals")
@@ -177,6 +179,21 @@ class TestExecutiveSummaryLines:
         lines = _executive_summary_lines(data, "show deals")
         assert len(lines) >= 3
         assert any("1" in l for l in lines)
+
+    def test_echo_line_uses_explicit_filter_and_collection(self):
+        data = [{"name": "A"}]
+        lines = _executive_summary_lines(
+            data,
+            "show contacts in usa",
+            response_meta={
+                "entity": "contact",
+                "collection": "contacts",
+                "filter": {"region": "USA"},
+            },
+        )
+        assert "Collection: contacts" in lines[0]
+        assert "region = 'USA'" in lines[0]
+        assert "Found 1 contact record(s)" in lines[0]
 
     def test_revenue_query_shows_total_if_present(self):
         data = [{"total_revenue_usd": 500000.0}]

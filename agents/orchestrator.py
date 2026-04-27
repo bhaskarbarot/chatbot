@@ -122,6 +122,16 @@ class ChatOrchestrator:
             if person_result is not None:
                 return person_result
 
+            # Step 2.3: Hard meetings routing pipeline
+            meetings_result = self._meetings_query_pipeline(user_query, resolved_query, start_time)
+            if meetings_result is not None:
+                return meetings_result
+
+            # Step 2.4: Hard linked-query pipeline (parent -> child ID filtering)
+            linked_result = self._linked_query_pipeline(user_query, resolved_query, start_time)
+            if linked_result is not None:
+                return linked_result
+
             # Step 3: Format hint detection (done early so routing pipelines can use it)
             format_hint = detect_format_intent(user_query)
             self._log("Format intent", format_hint)
@@ -182,8 +192,12 @@ class ChatOrchestrator:
                         if not self._is_empty_result(data):
                             result_count = self._estimate_result_count(data)
                             self._log("Fast-path result", f"{result_count} records")
-                            response = auto_format(data, user_query,
-                                                   fast_plan.get("response_hint", format_hint))
+                            response = auto_format(
+                                data,
+                                user_query,
+                                fast_plan.get("response_hint", format_hint),
+                                response_meta=self._build_response_meta(fast_plan, user_query, data),
+                            )
                             response = mask_response(response)
                             entity = fast_plan.get("entity")
                             collection = fast_plan.get("collection", "")
@@ -219,13 +233,21 @@ class ChatOrchestrator:
                         "Retrieval confidence",
                         f"confident={confidence['is_confident']} "
                         f"top={confidence['top_score']:.3f} "
-                        f"margin={confidence['margin']:.3f}"
+                        f"margin={confidence['margin']:.3f} "
+                        f"gate={confidence.get('gate', 'unknown')}"
                     )
+                    if confidence.get("gate") == "high_score":
+                        self._log("Retrieval gate", "Top score >= 0.75 — rule-compiled planning preferred")
+                    elif confidence.get("gate") == "margin_gate":
+                        self._log("Retrieval gate", "Moderate confidence — rule accepted via margin gate")
+                    else:
+                        self._log("Retrieval gate", "Below confidence gate — LLM planning allowed")
                     record_event("retrieval_confidence", {
                         "query": resolved_query[:120],
                         "is_confident": confidence["is_confident"],
                         "top_score": confidence["top_score"],
                         "margin": confidence["margin"],
+                        "gate": confidence.get("gate"),
                     })
                     if not confidence["is_confident"]:
                         self._log("Low-confidence retrieval", "Using only top rule template")
@@ -278,12 +300,19 @@ class ChatOrchestrator:
             query_plan = self._apply_business_intent_overrides(resolved_query, query_plan)
             query_plan = self._apply_entity_constraints(resolved_query, query_plan)
             query_plan = self._align_plan_with_collection_intent(resolved_query, query_plan)
+            query_plan = self._apply_temporal_sort_policy(resolved_query, query_plan)
 
             # Step 6: Execute query
             self._log("Executing query", "...")
             data = execute_query_plan(query_plan)
             result_count = self._estimate_result_count(data)
             self._log("Query result", f"{result_count} records")
+
+            # Specific entity lookup hard fallback chain (Patch 2 hard)
+            if self._is_empty_result(data):
+                exact_result = self._exact_lookup_zero_result_chain(resolved_query, query_plan, start_time)
+                if exact_result is not None:
+                    return exact_result
 
             # Step 6.5: Semantic verifier (for narrow entity searches with weak results)
             if (not self._is_empty_result(data)
@@ -308,9 +337,12 @@ class ChatOrchestrator:
                         query_plan = verified_plan
                         self._log("Verifier", "Corrective replan produced better result")
 
-            # Step 7: Empty result handling with replan
+            # Step 7: Empty result handling — max 1 LLM replan to prevent infinite loops
+            _replan_attempts = 0
             if self._is_empty_result(data):
-                if matched_rules and (time.time() - start_time) < max(15, MAX_RESPONSE_TIME * 0.65):
+                time_ok = (time.time() - start_time) < max(15, MAX_RESPONSE_TIME * 0.65)
+                if matched_rules and time_ok and _replan_attempts < 1:
+                    _replan_attempts += 1
                     self._log("Replan", "No results — retrying with semantic hint")
                     replan_query = (
                         f"{resolved_query}\n\n"
@@ -332,7 +364,7 @@ class ChatOrchestrator:
                             data = retry_data
                             query_plan = retry_plan
                 elif matched_rules:
-                    self._log("Replan skipped", "Time budget exceeded; using fallback strategy")
+                    self._log("Replan skipped", "Time budget or retry limit reached")
 
             if self._is_empty_result(data):
                 # Generic schema-aware fallback for empty aggregate/count outcomes.
@@ -352,6 +384,15 @@ class ChatOrchestrator:
                         query_plan = fallback_plan
 
             if self._is_empty_result(data):
+                date_retry_data, date_retry_plan = self._retry_with_date_field_aliases(
+                    resolved_query, query_plan
+                )
+                if not self._is_empty_result(date_retry_data):
+                    self._log("Date-field retry", "Recovered results using alternate date field")
+                    data = date_retry_data
+                    query_plan = date_retry_plan
+
+            if self._is_empty_result(data):
                 collection = query_plan.get("collection", "")
                 response = build_not_found_response(resolved_query, collection)
                 return self._build_result(response, start_time,
@@ -364,9 +405,19 @@ class ChatOrchestrator:
 
             if self._needs_llm_formatting(data, user_query):
                 response = self._llm_format(user_query, data, response_hint)
-                response = self._ensure_executive_summary(response, data, user_query)
+                response = self._ensure_executive_summary(
+                    response,
+                    data,
+                    user_query,
+                    response_meta=self._build_response_meta(query_plan, user_query, data),
+                )
             else:
-                response = auto_format(data, user_query, response_hint)
+                response = auto_format(
+                    data,
+                    user_query,
+                    response_hint,
+                    response_meta=self._build_response_meta(query_plan, user_query, data),
+                )
 
             # Step 9: Masking
             response = mask_response(response)
@@ -675,7 +726,12 @@ class ChatOrchestrator:
             }
             safe_results = execute_query_plan(safe_plan)
             if isinstance(safe_results, list) and safe_results:
-                response = auto_format(safe_results, user_query, format_hint)
+                response = auto_format(
+                    safe_results,
+                    user_query,
+                    format_hint,
+                    response_meta=self._build_response_meta(safe_plan, user_query, safe_results),
+                )
                 response = mask_response(response)
                 return self._build_result(
                     response, start_time, format_type=format_hint, collection=safe_coll
@@ -713,7 +769,16 @@ class ChatOrchestrator:
                 self._log("Fallback default", f"{len(safe_results)} recent rows from {safe_coll}")
 
         if all_results:
-            response = auto_format(all_results, user_query, format_hint)
+            response = auto_format(
+                all_results,
+                user_query,
+                format_hint,
+                response_meta=self._build_response_meta(
+                    {"collection": collections[0] if collections else ""},
+                    user_query,
+                    all_results,
+                ),
+            )
             response = mask_response(response)
             return self._build_result(response, start_time,
                                       format_type=format_hint,
@@ -772,7 +837,8 @@ class ChatOrchestrator:
             logger.error(f"LLM formatting error: {e}")
             return auto_format(data, query, format_hint)
 
-    def _ensure_executive_summary(self, response: str, data: Any, query: str) -> str:
+    def _ensure_executive_summary(self, response: str, data: Any, query: str,
+                                  response_meta: Optional[Dict[str, Any]] = None) -> str:
         """
         Ensure every LLM-formatted response starts with an executive summary.
         Adds a 3-line summary header if not already present.
@@ -784,9 +850,34 @@ class ChatOrchestrator:
         if any(response.lower().startswith(s) for s in summary_starters):
             return response
 
-        summary_lines = _executive_summary_lines(data, query)
+        summary_lines = _executive_summary_lines(data, query, response_meta=response_meta)
         summary_text = "\n".join(summary_lines)
         return f"{summary_text}\n{response}"
+
+    def _build_response_meta(self, plan: Optional[Dict[str, Any]], query: str,
+                             data: Any) -> Dict[str, Any]:
+        """Build formatter metadata for mandatory query/filter/count echo."""
+        plan = plan or {}
+        collection = plan.get("collection", "")
+        entity = plan.get("entity")
+        if isinstance(entity, dict):
+            entity = entity.get("type") or entity.get("name")
+        if not entity and collection:
+            entity = collection[:-1] if collection.endswith("s") else collection
+
+        filter_obj: Any = plan.get("filter")
+        if (filter_obj is None or filter_obj == {}) and plan.get("type") == "aggregate":
+            pipeline = plan.get("pipeline") if isinstance(plan.get("pipeline"), list) else []
+            for stage in pipeline:
+                if isinstance(stage, dict) and "$match" in stage and isinstance(stage["$match"], dict):
+                    filter_obj = stage["$match"]
+                    break
+
+        return {
+            "entity": entity,
+            "collection": collection,
+            "filter": filter_obj or {},
+        }
 
     def _is_greeting(self, query: str) -> bool:
         q = query.lower().strip().rstrip("!?.")
@@ -907,9 +998,9 @@ class ChatOrchestrator:
             if coll == "invoices" and inv_match and "invoice" in q_lower:
                 token = inv_match.group(1)
                 filt = out.get("filter") if isinstance(out.get("filter"), dict) else {}
-                filt.setdefault("invoice_number", {"$regex": token, "$options": "i"})
+                filt["invoice_number"] = token
                 out["filter"] = filt
-                if re.search(r"\b(first|1st)\b", q_lower) and out.get("type") == "find":
+                if out.get("type") == "find":
                     out["limit"] = 1
                 if date_filter:
                     out = self._merge_date_filter(out, date_filter)
@@ -919,10 +1010,9 @@ class ChatOrchestrator:
                 user_name = self._extract_person_name(q)
                 if user_name and out.get("type") == "find":
                     filt = out.get("filter") if isinstance(out.get("filter"), dict) else {}
-                    filt.setdefault("name", {"$regex": user_name, "$options": "i"})
+                    filt["name"] = user_name
                     out["filter"] = filt
-                    if any(t in q_lower for t in ["who is", "details", "summary"]):
-                        out["limit"] = 1
+                    out["limit"] = 1
                     if date_filter:
                         out = self._merge_date_filter(out, date_filter)
 
@@ -1003,16 +1093,10 @@ class ChatOrchestrator:
         return out
 
     def _infer_date_filter(self, query_lower: str, collection: Optional[str]) -> Optional[Dict[str, Any]]:
-        field_map = {
-            "invoices": "invoice_date",
-            "sales": "sales_date",
-            "deals": "createdAt",
-            "createtasks": "due_date",
-            "contacts": "createdAt",
-            "companies": "createdAt",
-        }
-        field = field_map.get(collection or "", "createdAt")
+        field = self._infer_date_field(query_lower, collection)
         now = datetime.now()
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
         if "last month" in query_lower:
             month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -1022,7 +1106,70 @@ class ChatOrchestrator:
 
         if "this month" in query_lower:
             start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            return {field: {"$gte": start.isoformat(), "$lte": today_end.isoformat()}}
+
+        if "this week" in query_lower:
+            week_start = day_start - timedelta(days=day_start.weekday())
+            week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+            return {field: {"$gte": week_start.isoformat(), "$lte": week_end.isoformat()}}
+
+        if "next week" in query_lower:
+            this_week_start = day_start - timedelta(days=day_start.weekday())
+            next_week_start = this_week_start + timedelta(days=7)
+            next_week_end = next_week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+            return {field: {"$gte": next_week_start.isoformat(), "$lte": next_week_end.isoformat()}}
+
+        if "next month" in query_lower:
+            first_this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            next_month_start = (first_this_month + timedelta(days=32)).replace(day=1)
+            next_month_end = ((next_month_start + timedelta(days=32)).replace(day=1)) - timedelta(seconds=1)
+            return {field: {"$gte": next_month_start.isoformat(), "$lte": next_month_end.isoformat()}}
+
+        if "next 7 days" in query_lower:
+            end = today_end + timedelta(days=7)
+            return {field: {"$gte": day_start.isoformat(), "$lte": end.isoformat()}}
+
+        if "next 30 days" in query_lower or "upcoming" in query_lower:
+            end = today_end + timedelta(days=30)
+            return {field: {"$gte": day_start.isoformat(), "$lte": end.isoformat()}}
+
+        if re.search(r"\blast\s+7\s+days\b", query_lower):
+            start = (day_start - timedelta(days=7))
             return {field: {"$gte": start.isoformat(), "$lte": now.isoformat()}}
+
+        if "last quarter" in query_lower:
+            quarter = ((now.month - 1) // 3) + 1
+            prev_quarter = 4 if quarter == 1 else quarter - 1
+            prev_year = now.year - 1 if quarter == 1 else now.year
+            start_month = ((prev_quarter - 1) * 3) + 1
+            quarter_start = datetime(prev_year, start_month, 1, 0, 0, 0)
+            if start_month == 10:
+                quarter_end = datetime(prev_year + 1, 1, 1, 0, 0, 0) - timedelta(seconds=1)
+            else:
+                quarter_end = datetime(prev_year, start_month + 3, 1, 0, 0, 0) - timedelta(seconds=1)
+            return {field: {"$gte": quarter_start.isoformat(), "$lte": quarter_end.isoformat()}}
+
+        if "next quarter" in query_lower:
+            quarter = ((now.month - 1) // 3) + 1
+            next_quarter = 1 if quarter == 4 else quarter + 1
+            next_year = now.year + 1 if quarter == 4 else now.year
+            start_month = ((next_quarter - 1) * 3) + 1
+            quarter_start = datetime(next_year, start_month, 1, 0, 0, 0)
+            if start_month == 10:
+                quarter_end = datetime(next_year + 1, 1, 1, 0, 0, 0) - timedelta(seconds=1)
+            else:
+                quarter_end = datetime(next_year, start_month + 3, 1, 0, 0, 0) - timedelta(seconds=1)
+            return {field: {"$gte": quarter_start.isoformat(), "$lte": quarter_end.isoformat()}}
+
+        if "closing soon" in query_lower:
+            end = today_end + timedelta(days=14)
+            close_field = "closing_date" if (collection or "").lower() == "deals" else field
+            return {close_field: {"$gte": day_start.isoformat(), "$lte": end.isoformat()}}
+
+        if "due soon" in query_lower:
+            end = today_end + timedelta(days=7)
+            due_field = "due_date" if (collection or "").lower() in {"invoices", "createtasks"} else field
+            return {due_field: {"$gte": day_start.isoformat(), "$lte": end.isoformat()}}
 
         rel = re.search(r"\blast\s+(\d+)\s+(day|week|month|year)s?\b", query_lower)
         if rel:
@@ -1055,6 +1202,31 @@ class ChatOrchestrator:
 
         return None
 
+    def _infer_date_field(self, query_lower: str, collection: Optional[str]) -> str:
+        """Pick date field for range filter based on query intent and collection."""
+        explicit = re.search(r"\b(closing_date|closeDate|due_date|last_activity|createdAt)\b", query_lower)
+        if explicit:
+            token = explicit.group(1)
+            if token == "closeDate":
+                return "closing_date"
+            return token
+
+        coll = (collection or "").lower()
+        if coll == "deals" and any(t in query_lower for t in ["closing", "close this week", "close next week"]):
+            return "closing_date"
+        if coll == "deals" and any(t in query_lower for t in ["upcoming closing", "closing soon"]):
+            return "closing_date"
+        if coll == "outreaches" and any(t in query_lower for t in ["new lead", "new leads"]):
+            return "createdAt"
+        if coll == "invoices" and "overdue" in query_lower:
+            return "due_date"
+        if coll == "createtasks" and "overdue" in query_lower:
+            return "due_date"
+        if coll == "meetings":
+            return "start"
+
+        return "createdAt"
+
     def _merge_date_filter(self, plan: Dict[str, Any], date_filter: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(plan)
         if out.get("type") == "find":
@@ -1079,6 +1251,316 @@ class ChatOrchestrator:
                 filt.setdefault(k, v)
             out["filter"] = filt
         return out
+
+    def _retry_with_date_field_aliases(self, query: str,
+                                       prior_plan: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        """
+        If a date-range query returns empty, retry with common date field aliases.
+        """
+        if not isinstance(prior_plan, dict):
+            return [], prior_plan
+        q_lower = (query or "").lower()
+        if not self._is_date_range_query(q_lower):
+            return [], prior_plan
+
+        aliases = ["created_at", "date_created", "createdDate"]
+        plan_type = prior_plan.get("type")
+        if plan_type not in {"find", "count", "aggregate"}:
+            return [], prior_plan
+
+        def _swap_key(obj: Dict[str, Any], from_key: str, to_key: str) -> Dict[str, Any]:
+            cloned = dict(obj)
+            if from_key in cloned:
+                cloned[to_key] = cloned.pop(from_key)
+            return cloned
+
+        # Find existing date field in filter/$match
+        current_field = None
+        if plan_type in {"find", "count"}:
+            filt = prior_plan.get("filter") if isinstance(prior_plan.get("filter"), dict) else {}
+            for k, v in filt.items():
+                if isinstance(v, dict) and any(op in v for op in ["$gte", "$lte", "$gt", "$lt"]):
+                    current_field = k
+                    break
+            if not current_field:
+                return [], prior_plan
+            for alias in aliases:
+                retry_plan = dict(prior_plan)
+                retry_filter = _swap_key(filt, current_field, alias)
+                retry_plan["filter"] = retry_filter
+                retry_data = execute_query_plan(retry_plan)
+                if not self._is_empty_result(retry_data):
+                    return retry_data, retry_plan
+            return [], prior_plan
+
+        pipeline = prior_plan.get("pipeline") if isinstance(prior_plan.get("pipeline"), list) else []
+        if not pipeline:
+            return [], prior_plan
+        first_match_idx = -1
+        for i, st in enumerate(pipeline):
+            if isinstance(st, dict) and "$match" in st and isinstance(st["$match"], dict):
+                first_match_idx = i
+                break
+        if first_match_idx < 0:
+            return [], prior_plan
+        match_stage = dict(pipeline[first_match_idx]["$match"])
+        for k, v in match_stage.items():
+            if isinstance(v, dict) and any(op in v for op in ["$gte", "$lte", "$gt", "$lt"]):
+                current_field = k
+                break
+        if not current_field:
+            return [], prior_plan
+
+        for alias in aliases:
+            retry_plan = dict(prior_plan)
+            retry_pipeline = list(pipeline)
+            retry_match = _swap_key(match_stage, current_field, alias)
+            retry_pipeline[first_match_idx] = {"$match": retry_match}
+            retry_plan["pipeline"] = retry_pipeline
+            retry_data = execute_query_plan(retry_plan)
+            if not self._is_empty_result(retry_data):
+                return retry_data, retry_plan
+        return [], prior_plan
+
+    def _is_meeting_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        return any(t in q for t in [
+            "meeting", "meetings", "scheduled call", "calendar", "schedule for",
+            "meeting history", "upcoming call", "booked session",
+        ])
+
+    def _meetings_query_pipeline(self, user_query: str, resolved_query: str,
+                                 start_time: float) -> Optional[Dict]:
+        if not self._is_meeting_query(resolved_query):
+            return None
+        q = resolved_query.lower()
+        now = datetime.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+        week_start = today_start - timedelta(days=today_start.weekday())
+        week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        upcoming_end = today_end + timedelta(days=30)
+
+        filt: Dict[str, Any] = {}
+        date_label = "upcoming 30 days"
+
+        if "meeting history" in q:
+            filt["start"] = {"$lt": now.isoformat()}
+            date_label = "past meetings"
+            entity = self._extract_named_object(q, {"company", "contact"})
+            if entity:
+                filt["$or"] = [{"title": {"$regex": entity, "$options": "i"}}]
+            sort = [["start", -1]]
+        elif "today" in q:
+            filt["start"] = {"$gte": today_start.isoformat(), "$lte": today_end.isoformat()}
+            date_label = "today"
+            sort = [["start", 1]]
+        elif "this week" in q:
+            filt["start"] = {"$gte": week_start.isoformat(), "$lte": week_end.isoformat()}
+            date_label = "this week"
+            sort = [["start", 1]]
+        elif "upcoming" in q or "next 30 days" in q or "get meetings" in q:
+            filt["start"] = {"$gte": today_start.isoformat(), "$lte": upcoming_end.isoformat()}
+            date_label = "today to next 30 days"
+            sort = [["start", 1]]
+        else:
+            filt["start"] = {"$gte": today_start.isoformat(), "$lte": upcoming_end.isoformat()}
+            sort = [["start", 1]]
+
+        user_name = self._extract_person_name(resolved_query)
+        if user_name and any(t in q for t in ["for ", "schedule for", "meetings for"]):
+            filt["assigned_to"] = user_name
+
+        plan = {"type": "find", "collection": "meetings", "filter": filt, "sort": sort, "limit": 20}
+        data = execute_query_plan(plan)
+
+        if self._is_empty_result(data):
+            response = (
+                f"No meetings scheduled for {date_label}.\n"
+                "Try: 'Get upcoming meetings for [user]' to see future meetings."
+            )
+            return self._build_result(response, start_time, format_type="not_found", collection="meetings")
+
+        prefix = (
+            f"Found {len(data)} meeting record(s) | Filter: date = '{date_label}' | Collection: meetings"
+        )
+        body = auto_format(data, user_query, "list", response_meta=self._build_response_meta(plan, user_query, data))
+        response = f"{prefix}\n{body}"
+        self.memory.add_exchange(user_query, response, collection="meetings")
+        return self._build_result(response, start_time, format_type="list", collection="meetings")
+
+    def _linked_query_pipeline(self, user_query: str, resolved_query: str,
+                               start_time: float) -> Optional[Dict]:
+        q = (resolved_query or "").lower()
+        relation_hit = any(t in q for t in [
+            "linked to", "associated with", "for this company", "for this deal",
+            "belonging to", "under ", "attached to",
+        ])
+        if not relation_hit:
+            return None
+
+        parent_type = None
+        if "company" in q:
+            parent_type = "company"
+        elif "deal" in q:
+            parent_type = "deal"
+        elif "contact" in q:
+            parent_type = "contact"
+        if not parent_type:
+            return None
+
+        parent_name = self._extract_named_object(resolved_query, {parent_type})
+        if not parent_name:
+            return None
+
+        child_map = [
+            ("task", "createtasks", "company_id", "deal_id"),
+            ("contact", "contacts", "company_id", "deal_id"),
+            ("deal", "deals", "company_id", "deal_id"),
+            ("invoice", "invoices", "company_id", "deal_id"),
+            ("sales", "sales", "company_id", "deal_id"),
+            ("order", "sales", "company_id", "deal_id"),
+        ]
+        child_type, child_collection, company_fk, deal_fk = "record", "", "", ""
+        for token, coll, c_fk, d_fk in child_map:
+            if token in q:
+                child_type, child_collection, company_fk, deal_fk = token, coll, c_fk, d_fk
+                break
+        if not child_collection:
+            return None
+
+        parent_id = resolve_name_to_id(parent_name, parent_type)
+        if not parent_id:
+            response = f"{parent_type.title()} '{parent_name}' was not found. Cannot retrieve linked {child_type}s."
+            return self._build_result(response, start_time, format_type="not_found", collection=child_collection)
+
+        fk_field = company_fk if parent_type == "company" else deal_fk
+        plan = {
+            "type": "find",
+            "collection": child_collection,
+            "filter": {fk_field: parent_id},
+            "sort": [["createdAt", -1]],
+            "limit": 50,
+        }
+        data = execute_query_plan(plan)
+        if self._is_empty_result(data):
+            response = f"No {child_type} records are linked to '{parent_name}'."
+            return self._build_result(response, start_time, format_type="not_found", collection=child_collection)
+
+        prefix = (
+            f"Found {len(data)} {child_type} record(s) | "
+            f"Linked to: {parent_type} = '{parent_name}' | Collection: {child_collection}"
+        )
+        body = auto_format(data, user_query, "list", response_meta=self._build_response_meta(plan, user_query, data))
+        response = f"{prefix}\n{body}"
+        self.memory.add_exchange(user_query, response, collection=child_collection)
+        return self._build_result(response, start_time, format_type="list", collection=child_collection)
+
+    def _extract_named_object(self, query: str, anchors: set) -> Optional[str]:
+        q = query or ""
+        anchor_rx = "|".join(re.escape(a) for a in anchors)
+        patterns = [
+            rf"(?:linked to|associated with|for|under|attached to)\s+(?:the\s+)?(?:{anchor_rx})\s+([A-Za-z0-9&.\-_/ ]{{2,120}})",
+            rf"(?:{anchor_rx})\s+(?:named|name is)\s+([A-Za-z0-9&.\-_/ ]{{2,120}})",
+        ]
+        for p in patterns:
+            m = re.search(p, q, re.IGNORECASE)
+            if m:
+                value = m.group(1).strip().strip(" .")
+                value = re.sub(r"\b(details?|records?|list|show|get)\b.*$", "", value, flags=re.IGNORECASE).strip()
+                if value:
+                    return value
+        return None
+
+    def _extract_specific_lookup_target(self, query: str, collection: str) -> Tuple[Optional[str], List[str]]:
+        q = query or ""
+        coll = (collection or "").lower()
+        invoice = re.search(r"\b([A-Z]{2,}[A-Z0-9]*[/-]\d{2,4}[/-]\d+)\b", q, re.IGNORECASE)
+        so = re.search(r"\b(?:so|sales\s*order)\s*(?:number|no|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9/_-]{2,})\b", q, re.IGNORECASE)
+        name = self._extract_named_object(q, {"invoice", "deal", "contact", "company", "sales order", "so"})
+
+        if coll == "invoices" and invoice:
+            return invoice.group(1).strip(), ["invoice_number", "name", "invoice_no", "ref"]
+        if coll == "sales" and so:
+            return so.group(1).strip(), ["so_number", "name", "order_number", "ref"]
+        if coll == "deals" and name:
+            return name, ["deal_name", "name", "title"]
+        if coll == "contacts" and name:
+            return name, ["full_name", "name", "display_name"]
+        if coll == "companies" and name:
+            return name, ["company_name", "name", "account_name"]
+        return None, []
+
+    def _exact_lookup_zero_result_chain(self, query: str, plan: Dict[str, Any],
+                                        start_time: float) -> Optional[Dict]:
+        if not isinstance(plan, dict) or plan.get("type") != "find":
+            return None
+        collection = plan.get("collection", "")
+        value, fields = self._extract_specific_lookup_target(query, collection)
+        if not value or not fields:
+            return None
+
+        sort = plan.get("sort", [["createdAt", -1]])
+        for field in fields:
+            # Attempt 1: exact equality
+            p1 = {"type": "find", "collection": collection, "filter": {field: value}, "sort": sort, "limit": 1}
+            d1 = execute_query_plan(p1)
+            if isinstance(d1, list) and len(d1) == 1:
+                response = auto_format(d1, query, "detail", response_meta=self._build_response_meta(p1, query, d1))
+                return self._build_result(response, start_time, format_type="detail", collection=collection)
+
+            # Attempt 2: case-insensitive exact regex
+            p2 = {
+                "type": "find",
+                "collection": collection,
+                "filter": {field: {"$regex": f"^{re.escape(value)}$", "$options": "i"}},
+                "sort": sort,
+                "limit": 1,
+            }
+            d2 = execute_query_plan(p2)
+            if isinstance(d2, list) and len(d2) == 1:
+                response = auto_format(d2, query, "detail", response_meta=self._build_response_meta(p2, query, d2))
+                return self._build_result(response, start_time, format_type="detail", collection=collection)
+
+        similar = search_by_keyword(collection, value, limit=3) or []
+        names = []
+        for row in similar[:3]:
+            if isinstance(row, dict):
+                for key in ["name", "invoice_number", "so_number", "companyName", "full_name", "title"]:
+                    if row.get(key):
+                        names.append(str(row.get(key)))
+                        break
+        close = ", ".join(names[:3]) if names else "none"
+        response = (
+            f"No record found for '{value}'. Please verify the name or number.\n"
+            f"Similar records available: {close}."
+        )
+        return self._build_result(response, start_time, format_type="not_found", collection=collection)
+
+    def _apply_temporal_sort_policy(self, query: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(plan or {})
+        q = (query or "").lower()
+        if out.get("type") != "find":
+            return out
+        field = self._infer_date_field(q, out.get("collection"))
+        if any(t in q for t in ["upcoming", "next week", "next month", "next quarter", "next 7 days", "next 30 days", "closing soon", "due soon"]):
+            out["sort"] = [[field, 1]]
+        elif "overdue" in q:
+            out["sort"] = [[field, -1]]
+        return out
+
+    def _is_date_range_query(self, q_lower: str) -> bool:
+        return bool(
+            ("week" in q_lower)
+            or ("month" in q_lower)
+            or ("quarter" in q_lower)
+            or ("upcoming" in q_lower)
+            or ("next" in q_lower)
+            or ("soon" in q_lower)
+            or re.search(r"\blast\s+\d+\s+days\b", q_lower)
+            or ("today" in q_lower)
+            or ("date" in q_lower)
+        )
 
     def _pick_numeric_metric_field(self, collection: str) -> Optional[str]:
         """Pick a likely numeric metric field from collection schema sample."""
@@ -1156,20 +1638,21 @@ class ChatOrchestrator:
         }
 
     def _extract_person_name(self, query: str) -> Optional[str]:
+        # Capture FULL names including hyphens, commas, ampersands — never truncate
         patterns = [
-            r'^\s*who\s+is\s+([a-z][a-z\s]{1,40})',
-            r'\bof\s+([a-z][a-z\s]{1,40})\b',
-            r'\bfor\s+([a-z][a-z\s]{1,40})\b',
+            r'^\s*who\s+is\s+([\w][\w\s\-&.,]{1,100})',
+            r'\bof\s+([\w][\w\s\-&.,]{1,100})',
+            r'\bfor\s+([\w][\w\s\-&.,]{1,100})',
         ]
         for p in patterns:
             m = re.search(p, query, re.IGNORECASE)
             if m:
                 name = m.group(1).strip()
                 name = re.sub(
-                    r'\b(give|show|get|details|summary|his|her|in|with|and)\b.*$',
+                    r'\s+\b(give|show|get|details|summary|his|her|in|with|and|please|including)\b.*$',
                     '', name, flags=re.IGNORECASE,
-                ).strip()
-                if name:
+                ).strip().rstrip(".,;")
+                if len(name) > 1:
                     return name
         return None
 
@@ -1420,7 +1903,7 @@ class ChatOrchestrator:
         users = execute_query_plan({
             "type": "find",
             "collection": "users",
-            "filter": {"name": {"$regex": name, "$options": "i"}},
+            "filter": {"name": name},
             "sort": [["name", 1]],
             "limit": 1,
         })
@@ -1437,8 +1920,8 @@ class ChatOrchestrator:
             "collection": "contacts",
             "filter": {
                 "$or": [
-                    {"firstName": {"$regex": name, "$options": "i"}},
-                    {"lastName": {"$regex": name, "$options": "i"}},
+                    {"firstName": name},
+                    {"lastName": name},
                 ]
             },
             "sort": [["createdAt", -1]],
@@ -1563,11 +2046,13 @@ class ChatOrchestrator:
                 filt["payment_status"] = "paid"
             if "overdue" in query:
                 filt["due_date"] = {"$lt": now_iso}
+                filt["payment_status"] = {"$ne": "paid"}
         elif collection == "createtasks":
             if "pending" in query:
                 filt["status"] = {"$in": ["Pending", "pending", "Open", "open"]}
             if "overdue" in query:
                 filt["due_date"] = {"$lt": now_iso}
+                filt["status"] = {"$nin": ["Completed", "completed"]}
         return filt
 
     def _build_parallel_summary_response(self, user_query: str, collection: str,
@@ -1576,9 +2061,15 @@ class ChatOrchestrator:
                                           format_hint: str = "summary") -> str:
         q = user_query.lower()
         category_field = _humanize_field(self._infer_category_field(collection, q))
+        echo_line = (
+            f"Found {total_count} {collection.rstrip('s')} record(s) | "
+            f"Filter applied: {self._infer_base_filter(collection, q) or 'none'} | "
+            f"Collection: {collection}"
+        )
 
         if format_hint == "table":
             lines = [
+                echo_line,
                 f"Total {collection}: {total_count}",
                 "",
                 f"| {category_field} | Count |",
@@ -1594,7 +2085,10 @@ class ChatOrchestrator:
             return "\n".join(lines)
 
         if ("categories" in q or "breakdown" in q) and "analysis" not in q and "summary" not in q:
-            lines = [f"Category breakdown by {category_field}:"]
+            lines = [
+                echo_line,
+                f"Category breakdown by {category_field}:",
+            ]
             if categories:
                 for row in categories[:10]:
                     lines.append(f"- {row.get('_id', 'Unknown')}: {row.get('count', 0)}")
@@ -1603,6 +2097,7 @@ class ChatOrchestrator:
             return "\n".join(lines)
 
         lines = [
+            echo_line,
             f"Summary: Found {total_count} {collection} record(s) matching your query.",
             f"Filtered from the ECRM {collection} module per your request.",
             f"Category breakdown and analysis shown below.\n",

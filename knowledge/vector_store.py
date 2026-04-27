@@ -172,11 +172,16 @@ def evaluate_match_confidence(results: List[Dict],
     top = float(results[0].get("final_score", results[0].get("similarity_score", 0.0)))
     second = float(results[1].get("final_score", results[1].get("similarity_score", 0.0))) if len(results) > 1 else 0.0
     margin = top - second
+    high_score_gate = top >= 0.75
+    margin_gate = top >= float(min_score) and margin >= float(min_margin)
+    is_confident = bool(high_score_gate or margin_gate)
+    gate = "high_score" if high_score_gate else ("margin_gate" if margin_gate else "rejected")
     return {
-        "is_confident": bool(top >= min_score and margin >= min_margin),
+        "is_confident": is_confident,
         "top_score": top,
         "second_score": second,
         "margin": margin,
+        "gate": gate,
     }
 
 
