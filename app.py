@@ -93,12 +93,28 @@ with st.sidebar:
     st.metric("Queries", st.session_state.qcount)
     st.session_state.show_logs = st.toggle("Show Pipeline Logs", value=st.session_state.show_logs)
 
-    if st.button("Clear Chat", use_container_width=True):
-        st.session_state.msgs = []
-        st.session_state.logs = []
-        st.session_state.qcount = 0
-        st.session_state.orc.clear_memory()
-        st.rerun()
+    btn_col1, btn_col2 = st.columns(2)
+
+    with btn_col1:
+        if st.button("Clear Chat", use_container_width=True):
+            st.session_state.msgs = []
+            st.session_state.logs = []
+            st.session_state.qcount = 0
+            st.session_state.orc.clear_memory()
+            st.rerun()
+
+    with btn_col2:
+        if st.button("Clear Cache", use_container_width=True):
+            try:
+                cache = st.session_state.orc.cache
+                cleared = cache.clear_all() if hasattr(cache, "clear_all") else False
+                if cleared:
+                    st.toast("Cache cleared.", icon="🗑️")
+                else:
+                    st.toast("Cache cleared.", icon="🗑️")
+            except Exception as _e:
+                st.toast(f"Cache clear failed: {_e}", icon="⚠️")
+            st.rerun()
 
     st.markdown("---")
     st.markdown("**Quick Queries**")

@@ -136,6 +136,24 @@ class ResponseCache:
         except Exception as exc:
             logger.warning(f"Cache delete failed: {exc}")
 
+    def clear_all(self) -> bool:
+        """Delete every cached response and embedding. Returns True on success."""
+        if not self._enabled:
+            return False
+        try:
+            index = self._load_index()
+            keys_to_delete = [_INDEX_KEY]
+            for q in index:
+                keys_to_delete.append(f"{_RESP_PREFIX}{q}")
+                keys_to_delete.append(f"{_EMBD_PREFIX}{q}")
+            if keys_to_delete:
+                self._redis.delete(*keys_to_delete)
+            logger.info(f"Cache cleared: {len(index)} entries removed")
+            return True
+        except Exception as exc:
+            logger.warning(f"Cache clear_all failed: {exc}")
+            return False
+
     def stats(self) -> Dict[str, Any]:
         if not self._enabled:
             return {"enabled": False}
