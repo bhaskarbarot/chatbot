@@ -838,3 +838,31 @@ def _extract_entity(query: str, rule: Dict,
                 break
         return {"type": entity_type, "name": first_param}
     return None
+
+
+class QueryPlanner:
+    """
+    Backward-compatible wrapper for planner module functions.
+    """
+
+    def plan(
+        self,
+        user_query: str,
+        matched_rules: List[Dict],
+        chat_context: str = "",
+        resolved_query: str = None,
+        format_hint: str = "auto",
+        relationship_context: str = "",
+        sort_hint: str = "",
+        limit_override: int = None,
+    ) -> Optional[Dict]:
+        return plan_query(
+            user_query=user_query,
+            matched_rules=matched_rules,
+            chat_context=chat_context,
+            resolved_query=resolved_query,
+            format_hint=format_hint,
+            relationship_context=relationship_context,
+            sort_hint=sort_hint,
+            limit_override=limit_override,
+        )

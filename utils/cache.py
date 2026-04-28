@@ -26,12 +26,15 @@ logger = get_logger("cache")
 _RESP_PREFIX = "chat:resp:"
 _EMBD_PREFIX = "chat:embd:"
 _INDEX_KEY = "chat:qidx"
+_CACHE_SCHEMA_VERSION = "v2"
 MAX_INDEX_SIZE = 500
 
 
 def _normalize(query: str) -> str:
     q = (query or "").lower().strip()
-    return re.sub(r"\s+", " ", q)
+    q = re.sub(r"\s+", " ", q)
+    # Versioned cache key avoids stale responses after formatter changes.
+    return f"{_CACHE_SCHEMA_VERSION}:{q}"
 
 
 @dataclass
@@ -75,10 +78,10 @@ class ResponseCache:
         with self._model_lock:
             if self._model is None:
                 try:
-                    from sentence_transformers import SentenceTransformer
-                    from config import EMBEDDING_MODEL
-                    self._model = SentenceTransformer(EMBEDDING_MODEL)
-                    logger.info("Cache embedding model loaded")
+                    # C4: reuse global vector-store singleton model instance.
+                    from knowledge.vector_store import get_embedding_model
+                    self._model = get_embedding_model()
+                    logger.info("Cache embedding model ready (shared singleton)")
                 except Exception as exc:
                     logger.warning(f"Cache embedding model unavailable: {exc}")
         return self._model

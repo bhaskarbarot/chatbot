@@ -6,6 +6,8 @@ business rule + query template.
 """
 import os
 import re
+import json
+import threading
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 
@@ -17,17 +19,21 @@ _model = None
 _index = None
 _rules = None
 _index_path = None
+_model_lock = threading.Lock()
 
 
 def get_embedding_model():
     """Load sentence-transformers model (cached)."""
     global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        from config import EMBEDDING_MODEL
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-        _model = SentenceTransformer(EMBEDDING_MODEL)
-        logger.info("Embedding model loaded")
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            from sentence_transformers import SentenceTransformer
+            from config import EMBEDDING_MODEL
+            logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
+            _model = SentenceTransformer(EMBEDDING_MODEL)
+            logger.info("Embedding model loaded")
     return _model
 
 
@@ -81,9 +87,15 @@ def load_index(index_dir: str) -> Tuple[any, List[Dict]]:
             loaded_rules = _json.load(f)
     elif os.path.exists(rules_pkl):
         import pickle
-        logger.warning("Loading rules from legacy pickle — re-run setup.py to upgrade to JSON")
         with open(rules_pkl, "rb") as f:
             loaded_rules = pickle.load(f)
+        # BUG 6 / C5: auto-migrate one-time from legacy pickle to JSON.
+        try:
+            with open(rules_file, "w", encoding="utf-8") as jf:
+                json.dump(loaded_rules, jf, ensure_ascii=False)
+            logger.info("Migrated legacy rules.pkl to rules.json")
+        except Exception as migration_error:
+            logger.warning(f"Legacy rules migration failed: {migration_error}")
     else:
         return None, None
 

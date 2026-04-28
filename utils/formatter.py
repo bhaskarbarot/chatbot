@@ -9,6 +9,9 @@ import json
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from utils.masking import mask_dict, mask_response
+from utils.logger import get_logger
+
+logger = get_logger("formatter")
 
 # ── Intent detection keywords ────────────────────────
 LIST_KEYWORDS = ["list", "which", "are", "all", "show me all", "find all",
@@ -122,6 +125,10 @@ def format_as_summary(data: List[Dict], query: str, total_count: int = None,
 
     count = total_count or len(data)
     lines = _executive_summary_lines(data, query, response_meta=response_meta)
+    collection = ((response_meta or {}).get("collection") or "")
+    filters = (response_meta or {}).get("filter") if isinstance(response_meta, dict) else {}
+    lines.append(_humanize_response_intro(count, collection, filters))
+    lines.append("")
 
     if count == 1:
         lines.append(_format_single_record(mask_dict(data[0])))
@@ -141,7 +148,10 @@ def format_as_list(data: List[Dict], query: str,
         return "\n".join(lines)
 
     lines = _executive_summary_lines(data, query, response_meta=response_meta)
-    lines.append(f"Found {len(data)} result(s):\n")
+    collection = ((response_meta or {}).get("collection") or "")
+    filters = (response_meta or {}).get("filter") if isinstance(response_meta, dict) else {}
+    lines.append(_humanize_response_intro(len(data), collection, filters))
+    lines.append("")
     for i, record in enumerate(data, 1):
         lines.append(_format_list_item(mask_dict(record) if isinstance(record, dict) else record, i))
 
@@ -255,10 +265,23 @@ def _wrap_number_response(value, query: str, collection: str = "") -> str:
     else:
         formatted = str(value)
 
+    query_l = (query or "").lower()
+    is_ratio_query = any(t in query_l for t in ("conversion", "rate", "percentage", "ratio"))
+    label = "Total"
+    if is_ratio_query:
+        label = "Conversion Rate"
+        try:
+            fval = float(value)
+            if 0 < fval < 1:
+                formatted = f"{fval * 100:.1f}%"
+            elif fval > 1:
+                formatted = f"{fval:.1f}%"
+        except Exception:
+            pass
     response_lines = [
-        f"Total count: **{formatted}**",
+        f"{label}: **{formatted}**",
         f"Collection: {collection or 'N/A'}",
-        f"Query: {query[:80]}"
+        f"Query: {query[:120]}"
     ]
     return "\n".join(response_lines)
 
@@ -280,17 +303,29 @@ def auto_format(data: Any, query: str, format_hint: str = "auto",
     if si.get("shape") in ("number", "count") or \
        vm.get("shape_applied") in (
            "aggregate_number", "direct_count", "number_from_list"):
+        logger.debug("[Formatter] Number path early-exit entered")
 
         # Case 1: Aggregate with extracted value
         agg = vm.get("aggregate_value", {})
         if agg.get("extracted"):
+            logger.debug("[Formatter] Number path: aggregate extracted")
             value = agg["value"]
             label = agg["label"].replace("_", " ").title()
             strategy = agg.get("strategy", "")
             all_fields = agg.get("all_fields", {})
 
             # Format value
-            if isinstance(value, float) and value != int(value):
+            lower_label = label.lower()
+            is_ratio_like = any(
+                word in lower_label for word in
+                ["rate", "percent", "percentage", "ratio", "conversion"]
+            )
+            if is_ratio_like:
+                if isinstance(value, (int, float)) and 0 < float(value) < 1:
+                    fval = f"{float(value) * 100:.1f}%"
+                else:
+                    fval = f"{float(value):.1f}%"
+            elif isinstance(value, float) and value != int(value):
                 fval = f"{value:,.2f}"
             else:
                 fval = f"{int(value):,}"
@@ -342,6 +377,7 @@ def auto_format(data: Any, query: str, format_hint: str = "auto",
         # Case 2: Direct count integer
         count_val = vm.get("count_value")
         if count_val is not None:
+            logger.debug("[Formatter] Number path: direct count from validation meta")
             # Use _wrap_number_response
             collection = response_meta.get("collection", "") \
                 if response_meta else ""
@@ -352,6 +388,7 @@ def auto_format(data: Any, query: str, format_hint: str = "auto",
 
         # Case 3: Data is a bare integer/float (direct count result)
         if isinstance(data, (int, float)) and not isinstance(data, bool):
+            logger.debug("[Formatter] Number path: bare numeric input")
             collection = response_meta.get("collection", "") \
                 if response_meta else ""
             result = _wrap_number_response(data, query, collection)
@@ -411,6 +448,7 @@ def auto_format(data: Any, query: str, format_hint: str = "auto",
         return response
 
     if isinstance(data, (int, float)):
+        logger.debug("[Formatter] Number path: generic numeric format_as_count")
         response = format_as_count(data, query, response_meta=response_meta)
         if len(response.strip()) < 30:
             response = _wrap_number_response(
@@ -477,7 +515,7 @@ def auto_format(data: Any, query: str, format_hint: str = "auto",
 
     if response and len(response.strip()) < 20:
         if isinstance(data, list) and len(data) > 0:
-            response = f"Found {len(data)} record(s):\n" + \
+            response = f"Here are {len(data)} records:\n" + \
                 "\n".join(str(r) for r in data[:10])
         elif isinstance(data, (int, float)):
             response = str(data)
@@ -512,6 +550,10 @@ def _executive_summary_lines(data: Any, query: str,
     explicit_collection = str(meta.get("collection") or "").strip()
     if explicit_entity:
         entity = explicit_entity
+    if explicit_collection and (not explicit_entity or explicit_entity == explicit_collection):
+        entity = _humanize_collection_name(explicit_collection).lower()
+    elif entity:
+        entity = _humanize_collection_name(entity).lower()
 
     returned_count = _resolve_returned_count(data)
     echo_filter = _render_filter_for_echo(
@@ -533,7 +575,7 @@ def _executive_summary_lines(data: Any, query: str,
     _q_echo = " ".join(_q_keywords[:7])
     echo_line_1 = (
         f"Showing results for: {_q_echo} | "
-        f"Found {returned_count} {entity} record(s) | "
+        f"Here are {returned_count} {entity} records | "
         f"Collection: {echo_collection}"
     )
     echo_line_2 = (
@@ -550,7 +592,7 @@ def _executive_summary_lines(data: Any, query: str,
             line2 = _get_no_data_explanation(q)
             line3 = "Try adjusting filters, date range, or search terms."
         else:
-            line1 = f"Answer: Found {count} {entity} record(s) for the applied filters."
+            line1 = f"Answer: Here are {count} {entity} records for the applied filters."
             line2 = f"This is the total count from the ECRM {entity} module."
             line3 = "Ask for a breakdown by status, stage, or owner for more detailed insights."
         return [echo_line_1, echo_line_2, line1, line2, line3, ""]
@@ -571,29 +613,29 @@ def _executive_summary_lines(data: Any, query: str,
         line1 = f"Answer: {count} {entity}(s) found matching your criteria."
     elif "revenue" in q or "total" in q:
         if total_val:
-            line1 = f"Summary: Total value is {total_val} across {count} record(s)."
+            line1 = f"Summary: Total value is {total_val} across {count} records."
         else:
-            line1 = f"Summary: {count} revenue/value record(s) found in the ECRM system."
+            line1 = f"Summary: {count} revenue/value records found in the ECRM system."
     elif "closed won" in q:
         line1 = f"Summary: {count} Closed Won deal(s) found in the ECRM pipeline."
     elif "closed lost" in q or "lost deal" in q:
         line1 = f"Summary: {count} Closed Lost deal(s) found in the ECRM system."
     elif "overdue" in q:
-        line1 = f"Summary: {count} overdue record(s) require immediate attention."
+        line1 = f"Summary: {count} overdue records require immediate attention."
     elif "pending" in q:
-        line1 = f"Summary: {count} pending {entity} record(s) are awaiting action."
+        line1 = f"Summary: {count} pending {entity} records are awaiting action."
     elif re.search(r'top\s+\d+', q):
         m = re.search(r'top\s+(\d+)', q)
         top_n = m.group(1) if m else str(count)
-        line1 = f"Summary: Top {top_n} {entity} record(s) retrieved based on your criteria."
+        line1 = f"Summary: Top {top_n} {entity} records retrieved based on your criteria."
     elif "this month" in q:
-        line1 = f"Summary: {count} {entity} record(s) found for this month."
+        line1 = f"Summary: {count} {entity} records found for this month."
     elif "last month" in q:
-        line1 = f"Summary: {count} {entity} record(s) found for last month."
+        line1 = f"Summary: {count} {entity} records found for last month."
     elif "this year" in q or "financial year" in q:
-        line1 = f"Summary: {count} {entity} record(s) found for this financial year."
+        line1 = f"Summary: {count} {entity} records found for this financial year."
     else:
-        line1 = f"Summary: Found {count} {entity} record(s) for the applied filters."
+        line1 = f"Summary: Here are {count} {entity} records for the applied filters."
 
     # Line 2: Context or key insight
     if key_stat:
@@ -944,6 +986,49 @@ def _humanize_key(key: str) -> str:
     result = re.sub(r'([a-z])([A-Z])', r'\1 \2', key)
     result = result.replace("_", " ").title()
     return result
+
+
+def _humanize_collection_name(collection: str) -> str:
+    """Convert DB collection name to human-readable label."""
+    if not collection:
+        return "Record"
+    label = str(collection).strip().replace("_", " ").replace("-", " ")
+    if label.lower().endswith("ies") and len(label) > 3:
+        label = label[:-3] + "y"
+    elif label.lower().endswith("s") and len(label) > 1:
+        label = label[:-1]
+    if "create" in label.lower():
+        label = re.sub(r"create", "", label, flags=re.IGNORECASE).strip()
+    return label.title() if label else "Record"
+
+
+def _build_natural_filter_description(filters: dict) -> str:
+    """Convert filter dict to natural language."""
+    if not isinstance(filters, dict) or not filters:
+        return ""
+    parts = []
+    for key, val in filters.items():
+        if key in _SOFT_DELETE_FIELDS:
+            continue
+        sval = str(val).strip().lower()
+        if sval in ("none", "null", "", "{}"):
+            continue
+        field = str(key).replace("_", " ").replace("At", "").strip()
+        parts.append(f"with {field}: {val}")
+    return " and ".join(parts[:2]) if parts else ""
+
+
+def _humanize_response_intro(count: int, collection: str, filters: dict) -> str:
+    """Build human-readable intro for list responses."""
+    entity = _humanize_collection_name(collection)
+    if count == 0:
+        return f"No {entity} records found matching your criteria."
+    if count == 1:
+        return f"Here is 1 {entity} record:"
+    filter_desc = _build_natural_filter_description(filters)
+    if filter_desc:
+        return f"Here are {count} {entity} records {filter_desc}:"
+    return f"Here are {count} {entity} records from the CRM:"
 
 
 def _get_name_field(record: dict) -> Optional[str]:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional
 
 from utils.logger import get_logger
@@ -38,6 +39,7 @@ _DATE_FIELD_ALIASES: List[str] = [
 
 _TOTAL_BUDGET_S = 12.0        # FIX 3: reduced from 15s so total stays <30s
 _PER_ATTEMPT_BUDGET_S = 5.0  # FIX 3: reduced from 8s; LLM replan must be fast
+_REPLAN_TIMEOUT_S = 5.0
 
 
 class SelfHealingAgent:
@@ -149,28 +151,38 @@ class SelfHealingAgent:
         if not date_filter_key:
             return None
 
-        original_value = filter_dict[date_filter_key]
+        original_value = filter_dict.get(date_filter_key)
+        if not isinstance(original_value, dict):
+            return None
 
-        for alias in _DATE_FIELD_ALIASES:
-            if time.time() - entry_time > _PER_ATTEMPT_BUDGET_S:
-                break
-            if alias == date_filter_key:
-                continue  # already tried this one
+        # BUG 2 / C6: Use one $or query across aliases instead of sequential calls.
+        try:
+            trial_plan = copy.deepcopy(plan)
+            trial_filter = trial_plan.get("filter")
+            if not isinstance(trial_filter, dict):
+                return None
+            trial_filter.pop(date_filter_key, None)
+            existing_or = trial_filter.get("$or")
+            if not isinstance(existing_or, list):
+                existing_or = []
+            alias_conditions = []
+            seen_fields = set()
+            for alias in _DATE_FIELD_ALIASES:
+                if alias in seen_fields:
+                    continue
+                seen_fields.add(alias)
+                alias_conditions.append({alias: copy.deepcopy(original_value)})
+            if date_filter_key not in seen_fields:
+                alias_conditions.append({date_filter_key: copy.deepcopy(original_value)})
+            trial_filter["$or"] = existing_or + alias_conditions
+            trial_plan["filter"] = trial_filter
 
-            try:
-                trial_plan = copy.deepcopy(plan)
-                # Remove old key, insert alias
-                del trial_plan["filter"][date_filter_key]
-                trial_plan["filter"][alias] = original_value
-
-                data = mongo_execute_fn(trial_plan)
-                if not _is_empty(data):
-                    logger.debug(f"[SelfHealing] Field alias '{alias}' worked")
-                    return data
-            except Exception as e:
-                logger.debug(f"[SelfHealing] Alias '{alias}' failed: {e}")
-                continue
-
+            data = mongo_execute_fn(trial_plan)
+            if not _is_empty(data):
+                logger.debug("[SelfHealing] Batched date alias retry succeeded")
+                return data
+        except Exception as e:
+            logger.debug(f"[SelfHealing] Batched alias retry failed: {e}")
         return None
 
     # ── Attempt 2A: Constraint relaxation ────────────────────────────────────
@@ -259,7 +271,17 @@ class SelfHealingAgent:
         )
 
         try:
-            new_plan = query_planner_fn(replan_query, [], "")
+            # C7: hard-cap self-healing replan call to 5 seconds.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(query_planner_fn, replan_query, [], "")
+                try:
+                    new_plan = future.result(timeout=_REPLAN_TIMEOUT_S)
+                except FutureTimeoutError:
+                    logger.warning(
+                        "[SelfHealing] Replan timed out after "
+                        f"{_REPLAN_TIMEOUT_S}s - skipping"
+                    )
+                    return None
             if new_plan and isinstance(new_plan, dict):
                 data = mongo_execute_fn(new_plan)
                 if not _is_empty(data):

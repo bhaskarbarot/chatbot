@@ -285,7 +285,8 @@ def check_02_ui_format(response):
     if response.strip().startswith("{") or response.strip().startswith("["):
         try:
             json.loads(response.strip()); return (False, "Raw JSON")
-        except: pass
+        except json.JSONDecodeError:
+            pass
     if re.search(r"ObjectId\(|ISODate\(", response): return (False, "Raw BSON")
     if len(response.strip()) < 10: return (False, "Too short")
     return (True, "Clean text")

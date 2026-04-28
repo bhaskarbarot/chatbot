@@ -1,364 +1,248 @@
-# Project Workflow (Complete Guide)
+# Project Workflow (Current System)
 
-This document explains the full workflow of this project in simple language: what happens from app start to final response, and how rules, embeddings, connections, query building, and chat summary work together.
-
----
-
-## 1) What this project does
-
-This is an AI-powered CRM chatbot built with Streamlit.
-
-It allows a user to ask business questions in natural language (for example, "show my latest meetings", "how many leads this month", "companies linked to owner X"), and then:
-
-1. Understands the user intent.
-2. Converts the question into a safe MongoDB query plan.
-3. Executes that query on MongoDB.
-4. Formats the results into a human-friendly answer.
-5. Stores useful chat context for follow-up questions.
+This file describes the **current production workflow** of the Elsner ECRM chatbot, including all enhancement layers added in the latest audit cycle.
 
 ---
 
-## 2) Main components and their jobs
+## 1) System goal
 
-## UI Layer
+The chatbot converts natural-language CRM questions into safe MongoDB operations and returns contextual, human-readable responses.
+
+Core behavior:
+- Understand user intent and context.
+- Build or select an execution plan.
+- Execute safely on MongoDB.
+- Validate + shape results.
+- Format response with context and masking.
+- Update memory/cache/metrics asynchronously.
+
+---
+
+## 2) Current architecture map
+
+### UI and entrypoint
 - `app.py`
-  - Streamlit chat interface.
-  - Accepts user query.
-  - Shows answer and optional pipeline/debug info.
+  - Streamlit chat UI.
+  - Creates `ChatOrchestrator`.
+  - Displays answers, logs, and health indicators.
 
-## Core Brain (Orchestration)
+### Central orchestrator
 - `agents/orchestrator.py`
-  - Main controller (`ChatOrchestrator.process_query()`).
-  - Decides which path to use (greeting, fast intent, special pipeline, full LLM planning, fallback, etc.).
-  - Connects all other modules.
+  - Main runtime coordinator (`process_query`).
+  - Handles routing across fast paths, rule paths, LLM planning, fallback, and recovery.
 
-## Query Planner (LLM + validation)
-- `agents/query_planner.py`
-  - Builds prompts for the LLM.
-  - Converts LLM output into JSON query plan.
-  - Validates schema and retries if needed.
-  - Blocks risky operators and enforces safe query shape.
-
-## Rule Knowledge + Embedding Retrieval
-- `knowledge/rule_parser.py`
-  - Parses rule files (`rules.txt`, `CHATBOT_QUERY_RULES.md`) into structured rule entries.
-- `knowledge/vector_store.py`
-  - Creates embeddings of rules.
-  - Stores/retrieves them in FAISS.
-  - Returns top matching rules for a user query.
-
-## Query Understanding / Intent
+### Understanding layers
 - `knowledge/query_understander.py`
-  - Extracts entities, limits, sorting hints, temporal hints, and intent clues.
+  - Regex/entity/temporal extraction.
+- `knowledge/deep_query_understander.py`
+  - LLM-backed deeper semantic understanding with rule-based fallback.
 - `knowledge/intent_classifier.py`
-  - Fast intent detection path.
-  - Can directly build simple plans without expensive full planning.
+  - Fast high-confidence intent routing.
+- `knowledge/intent_enricher.py`
+  - Merges classifier + understanders into one enriched intent contract.
 
-## Data Layer (MongoDB)
+### Planning and execution layers
+- `agents/query_planner.py`
+  - LLM query plan generation + schema/operator validation.
+- `agents/structured_plan_wrapper.py`
+  - Adds shape contract, enforced limits, and step metadata.
+- `knowledge/relationship_enhancer.py`
+  - Injects join hints using relationship graph when needed.
 - `tools/mongodb_tool.py`
-  - MongoDB connection singleton.
-  - Executes `find`, `aggregate`, `count`, `distinct`, and multi-step plans.
-  - Applies sanitization and safe defaults.
+  - Sanitized Mongo execution engine (`find`, `aggregate`, `count`, `distinct`, `multi_step`).
+  - Wrapped with Mongo circuit breaker.
 
-## Conversation Memory + Summary
-- `memory/chat_memory.py`
-  - Stores recent chat exchanges.
-  - Resolves follow-up questions using previous topic/entity.
-  - Maintains summary and contextual relationship checks.
+### Post-execution quality layers
+- `agents/response_validator.py`
+  - Enforces result shape, count/list/single expectations, field filtering, aggregate extraction.
+- `agents/self_healing_agent.py`
+  - Recovery when results are empty.
+  - Uses bounded attempts and strict timeout guards.
 
-## Output and Guardrails
-- `utils/formatter.py` -> response formatting.
-- `utils/masking.py` -> hides sensitive information where needed.
-- `utils/cache.py` -> semantic cache for repeated/similar queries.
-- `utils/circuit_breaker.py` -> protects against repeated failures (LLM/Mongo).
-- `utils/metrics.py` -> logs timings/metrics.
+### Output control layers
+- `utils/response_controller.py`
+  - Shape instruction generation + post-format correction.
+- `utils/formatter.py`
+  - Humanized contextual formatting (never bare number responses).
+- `utils/masking.py`
+  - Sensitive-value masking.
 
-## Relationship Metadata
+### Knowledge and retrieval
+- `knowledge/rule_parser.py`
+  - Parses rule sources to structured rules.
+- `knowledge/vector_store.py`
+  - FAISS + embeddings retrieval.
+  - Thread-safe shared singleton embedding model.
+  - Auto-migrates legacy `rules.pkl` -> `rules.json`.
 - `knowledge/relationship_graph.py`
-  - Reads `connection.txt`.
-  - Builds relation graph (collection links / foreign key style connections).
-  - Helps linked/multi-collection logic.
+  - Collection relationship graph from `connection.txt`.
+
+### Memory, cache, reliability, metrics
+- `memory/chat_memory.py` + `memory/enhanced_memory_resolver.py`
+  - Follow-up resolution and async context storage.
+- `utils/cache.py`
+  - Redis semantic response cache.
+  - Reuses vector-store embedding singleton.
+  - Schema-versioned cache keys to avoid stale-format responses.
+- `utils/circuit_breaker.py`
+  - LLM + Mongo circuit breakers.
+- `utils/metrics.py`
+  - Non-blocking metrics writer.
 
 ---
 
-## 3) Full runtime flow (end-to-end)
+## 3) End-to-end runtime flow (current)
 
-When a user asks a question, this is the practical sequence:
+1. **Receive query**
+   - `app.py` sends query to `ChatOrchestrator.process_query()`.
 
-1. **Input received**
-   - User sends query in Streamlit UI.
-   - Query enters `ChatOrchestrator.process_query()`.
+2. **Guard + preprocessing**
+   - Greeting/out-of-scope checks.
+   - Follow-up resolution via enhanced memory resolver.
+   - Query understanding via fast + deep layers.
 
-2. **Early checks**
-   - Greeting/out-of-scope checks run first.
-   - If greeting, return friendly message.
-   - If out of scope, return safe "not supported" style response.
+3. **Intent enrichment**
+   - Build unified `enriched_intent` with:
+     - primary intent
+     - response shape
+     - limit/sort/temporal hints
+     - collection hints
+     - multi-intent flag
 
-3. **Use memory context**
-   - Chat memory checks if this is a follow-up ("that one", "same owner", "what about this month?").
-   - If yes, query may be enriched with last known entity/topic.
+4. **Fast-path routing**
+   - Attempt deterministic/specialized pipelines first (existence, person/company linked queries, etc.).
 
-4. **Quick understanding**
-   - Extract intent clues, entities, dates, limits, sorting preferences.
-   - Detect if query matches specialized pipeline (for example meetings/person lookup/comparison/existence/linked queries).
+5. **Cache lookup**
+   - Exact/semantic Redis cache lookup.
+   - If valid cache hit -> return quickly.
 
-5. **Specialized pipeline attempt**
-   - If a specialized handler fits, it may directly build an accurate plan and skip heavy planning.
-   - This is faster and often more reliable for known patterns.
+6. **Rule retrieval (RAG)**
+   - FAISS search + confidence gating.
+   - High confidence may trigger rule-compiled plan.
 
-6. **Cache check**
-   - System checks semantic cache for similar recent queries.
-   - If valid cached response exists, it returns quickly.
+7. **Plan generation**
+   - Either:
+     - deterministic plan from rule/intent, or
+     - LLM plan (`query_planner`) with strict schema/operator safety.
 
-7. **Rule retrieval (RAG step)**
-   - Query embedding is generated.
-   - FAISS retrieves most relevant rules.
-   - Keyword boosting and confidence gating rank best rules.
+8. **Plan wrapping + enhancement**
+   - `structured_plan_wrapper`: adds shape contracts/limits.
+   - `relationship_enhancer`: adds join hints where needed.
 
-8. **Plan building**
-   - Two major possibilities:
-     - **Deterministic plan** from matched rule / fast intent.
-     - **LLM-generated plan** using prompt + matched rules + constraints.
-   - Planner validates output JSON format and schema.
-   - If invalid, repair/retry logic runs.
+9. **Mongo execution**
+   - Execute via sanitized `mongodb_tool`.
+   - Circuit breaker protects connection/command failures.
 
-9. **Plan post-processing**
-   - Business intent overrides.
-   - Entity constraints and collection alignment.
-   - Temporal sort/limit normalization.
-   - Additional sanity checks before execution.
+10. **Validation layer**
+   - `response_validator` enforces shape and extracts aggregate numeric values.
+   - Flags empty result behavior.
 
-10. **Mongo execution**
-   - Plan is sanitized and executed in MongoDB.
-   - Supports aggregation, filtering, sorting, counting, distinct, and multi-step operations.
+11. **Self-healing (bounded recovery)**
+   - Triggered only when required and within time budget.
+   - Attempt order (bounded):
+     1. Batched date alias `$or` retry (single call strategy).
+     2. Constraint relaxation.
+     3. Replan with hard timeout (5s max).
+   - Stops with graceful message if all fail.
 
-11. **Fallbacks if no/poor results**
-   - Exact lookup recovery attempts.
-   - Replan attempts with adjusted constraints.
-   - Date field alias retries.
-   - Schema fallback plan in some cases.
+12. **Response shaping and formatting**
+   - `response_controller` + `formatter` produce final text.
+   - Numeric answers always include label + collection + query context.
+   - Humanized collection names used for user-facing language.
 
-12. **Response generation**
-   - Results are auto-formatted or LLM-formatted.
-   - Sensitive data masking applied.
-   - Final text returned to UI.
+13. **Mask + return**
+   - Sensitive values masked.
+   - Final response returned to UI.
 
-13. **Post-response updates**
-   - Save query/response in memory.
-   - Update summary asynchronously.
-   - Store useful response in semantic cache.
-   - Record metrics/logs.
+14. **Async post-response updates**
+   - Memory store/update.
+   - Cache set.
+   - Metrics logging.
 
 ---
 
-## 4) How rule understanding works
+## 4) Rule and embedding workflow
 
-Rules are the project’s domain knowledge layer.
-
-### Rule sources
+### Sources
 - `rules.txt`
 - `CHATBOT_QUERY_RULES.md`
 
-### Rule parsing process
-1. Parse raw rule text into structured entries:
-   - intent
-   - process instructions
-   - target collections
-   - relevant fields
-   - keywords
-   - search text (used for embedding)
-2. Merge duplicates by normalized intent.
-3. Keep final rule set for retrieval/planning.
+### Build/setup
+1. Parse rules to structured records.
+2. Create embeddings.
+3. Build FAISS index (`rules.index`) + metadata (`rules.json`).
 
-### Runtime rule usage
-1. User query is compared semantically to rules.
-2. Top rules are fetched from FAISS + boosted by keyword overlap.
-3. Confidence checks (score + margin) decide trust level.
-4. High-confidence matches can create direct deterministic plans.
-5. Otherwise, retrieved rules are injected into LLM prompt so planner still follows rule intent.
+### Runtime retrieval
+1. Embed user query.
+2. Search FAISS top-k.
+3. Keyword-boost rerank.
+4. Confidence gate to decide:
+   - trust rule-compiled plan, or
+   - fall back to LLM planning with retrieved context.
+
+### Legacy migration behavior
+- If only `rules.pkl` exists, system loads it and writes `rules.json` immediately (one-time auto-migration).
 
 ---
 
-## 5) How embeddings work
+## 5) Query safety model
 
-Embeddings are used for semantic matching of user questions to rules.
-
-### Embedding model
-- Sentence Transformers model from `EMBEDDING_MODEL`.
-
-### Index build (offline/setup)
-1. Build embedding vector for each rule’s searchable text.
-2. Normalize vectors.
-3. Store in FAISS index (`knowledge/faiss_index/rules.index`).
-4. Save metadata mapping (rule JSON).
-
-### Query-time retrieval
-1. Convert user query into embedding.
-2. Search nearest vectors in FAISS (top-k).
-3. Apply keyword boost re-ranking.
-4. Return best rules with confidence values.
-
-This gives semantic recall even when user wording is different from exact rule text.
+Safety controls currently active:
+- Planner blocks dangerous operators (e.g. `$where`, `$function`).
+- Mongo tool sanitizes filter/pipeline content.
+- Collection validation against allowed set.
+- Soft-delete conditions injected where configured.
+- Mongo circuit breaker wraps DB calls.
+- LLM circuit breaker wraps model calls.
+- All failure paths return graceful, non-crashing output.
 
 ---
 
-## 6) How connection graph is used
+## 6) Response quality model (current)
 
-The file `connection.txt` stores relationship knowledge (how collections are linked).
-
-`knowledge/relationship_graph.py` parses this into a graph-like mapping that helps:
-- linked entity lookups,
-- multi-step query planning,
-- selecting join-style traversal paths,
-- suggesting collection path when user asks relation-based questions.
-
-This is especially useful for queries like:
-- "show contacts linked to company X"
-- "owners for companies with meetings this week"
-- "records connected through another entity"
+Current quality guarantees:
+- No bare numeric responses (label + context required).
+- Human-readable intros for lists.
+- Dynamic collection humanization (e.g. `createtasks` -> `task`).
+- Aggregate extraction handles `_id = 0` summary docs.
+- Conversion/rate-like numeric responses formatted as percentages.
+- Query echo included for relevance transparency.
 
 ---
 
-## 7) How query plan is built
+## 7) Memory and follow-up behavior
 
-The project does not run raw user text directly on DB.  
-It first builds a safe, structured plan.
-
-### Plan inputs
-- user query,
-- extracted entities/intents,
-- retrieved rules,
-- relationship hints,
-- business constraints.
-
-### Plan strategies
-1. **Fast deterministic path**
-   - For known simple intents.
-   - Built via `build_fast_plan()`.
-2. **Rule-based direct plan**
-   - If confident rule match exists.
-3. **LLM planning path**
-   - For complex/ambiguous requests.
-   - Prompt contains strict schema and safety instructions.
-
-### Plan safety and validation
-- JSON extraction and schema validation.
-- Dangerous operator blocking.
-- Plan sanitization before execution.
-- Retry/repair when malformed.
-
-This structure reduces hallucination risk and keeps DB execution controlled.
+- Short-term conversational context maintained.
+- Follow-up strategies include:
+  - last result set references ("those", "these")
+  - same-filter continuation
+  - entity carry-forward (guarded by type relevance)
+- Async context storage uses daemon threads and does not block response path.
 
 ---
 
-## 8) How chat memory and summary work
+## 8) Performance and resiliency controls
 
-The chatbot keeps short conversational memory to support natural follow-ups.
-
-### Stored context
-- recent user/assistant exchanges,
-- last entity mentioned,
-- last topic/collection context,
-- running summary.
-
-### Follow-up resolution examples
-- "what about this month?"
-- "and for owner Rahul?"
-- "same for last week"
-
-System resolves these by carrying forward relevant context from previous turn.
-
-### Summary behavior
-- Summary generation/refresh runs asynchronously.
-- Main response path is not blocked by summary updates.
-- Relatedness checks decide whether previous context should apply.
+- Shared thread-safe embedding singleton (no duplicate concurrent model loads).
+- Semantic cache for repeated/similar queries.
+- Strict time budgeting in orchestrator.
+- Self-healing replan hard timeout (5s).
+- Non-blocking memory/cache/metrics updates where applicable.
 
 ---
 
-## 9) Data connections and external dependencies
+## 9) Operational files and purpose
 
-### MongoDB
-- Main source of business records.
-- Configured by `MONGODB_URI` and `MONGODB_DB`.
-
-### Ollama / LLM
-- Planner and optional formatter/summarizer models.
-- Configured by `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_SUMMARY_MODEL`.
-
-### Redis (optional but useful)
-- Semantic response caching.
-- Controlled by `REDIS_URL`, TTL and similarity thresholds.
-
-### FAISS (local)
-- Rule embedding index.
-
-### Sentence-transformers
-- Embedding generation model.
+- `config.py` -> centralized runtime configuration.
+- `connection.txt` -> relationship metadata source.
+- `requirements.txt` -> dependencies.
+- `setup.py` -> builds rule artifacts and index.
+- `scripts/run_qa_tests.py` -> 60-query QA.
+- `scripts/run_full_qa_tests.py` -> 170-query QA.
 
 ---
 
-## 10) Startup and setup workflow
+## 10) Current mental model
 
-### Typical run
-1. Execute `run.sh`.
-2. Create/use Python venv.
-3. Install dependencies from `requirements.txt`.
-4. If index is missing, run `setup.py`.
-5. Start Streamlit app (`streamlit run app.py`).
-
-### What `setup.py` prepares
-- parses and merges rules,
-- builds/saves FAISS index + metadata,
-- parses connections metadata,
-- basic retrieval sanity checks,
-- Mongo connectivity check.
-
-### Optional support scripts
-- `scripts/ensure_indexes.py` -> create Mongo indexes.
-- `scripts/run_qa_tests.py` / `scripts/run_full_qa_tests.py` -> QA/regression checks.
-- `scripts/benchmark_all_rules.py` -> performance/coverage benchmarking.
-
----
-
-## 11) Key configuration checklist
-
-Minimum to run:
-- `MONGODB_URI`
-
-Common required for full quality:
-- `MONGODB_DB`
-- `OLLAMA_BASE_URL`
-- `OLLAMA_MODEL`
-- `EMBEDDING_MODEL`
-- `TOP_K_RULES`
-- `MAX_MONGO_RESULTS`
-- `RETRIEVAL_MIN_SCORE`
-- `RETRIEVAL_MIN_MARGIN`
-- `LOG_LEVEL`
-
-Optional but recommended:
-- `REDIS_URL`
-- `CACHE_TTL_SECONDS`
-- `CACHE_SIMILARITY_THRESHOLD`
-- circuit breaker envs for reliability
-- auth envs if login protection is needed
-
----
-
-## 12) Reliability and safety features
-
-- Query plan schema enforcement.
-- Dangerous Mongo operators blocked.
-- Sanitization before execution.
-- Circuit breakers for repeated dependency failure.
-- Timeout limits and response-time controls.
-- Sensitive field masking in final response.
-- Cache short-circuit for repeated questions.
-- Multiple fallback chains when result is empty.
-
----
-
-## 13) One-line mental model
-
-**User question -> understand intent + context -> retrieve relevant rules (embedding search) -> build safe query plan -> execute on MongoDB -> format/mask response -> store memory/summary/cache -> return answer.**
+**User query -> understand + enrich intent -> retrieve rules -> build/validate plan -> execute safely -> validate/heal -> shape + format + mask -> async memory/cache/metrics update -> return response.**
 

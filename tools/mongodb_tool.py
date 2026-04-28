@@ -14,6 +14,7 @@ from pymongo.errors import PyMongoError
 from config import MONGODB_URI, MONGODB_DB, MAX_MONGO_RESULTS, SOFT_DELETE_MAP, COLLECTION_NAMES
 from utils.logger import get_logger
 from utils.metrics import record_event
+from utils.circuit_breaker import get_mongo_breaker
 
 logger = get_logger("mongodb_tool")
 MAX_MONGO_TIME_MS = 15000
@@ -22,6 +23,12 @@ MAX_MONGO_TIME_MS = 15000
 _client: Optional[MongoClient] = None
 _db = None
 _db_lock = threading.Lock()
+
+
+def _mongo_call(func, fallback):
+    """Route MongoDB network calls through circuit breaker."""
+    breaker = get_mongo_breaker()
+    return breaker.call(func, fallback=fallback)
 
 
 def get_db():
@@ -39,7 +46,9 @@ def get_db():
                     socketTimeoutMS=10000,
                     maxPoolSize=10
                 )
-                _client.admin.command("ping")
+                ping_ok = _mongo_call(lambda: _client.admin.command("ping"), fallback=None)
+                if ping_ok is None:
+                    raise PyMongoError("MongoDB ping blocked by circuit breaker")
                 _db = _client[MONGODB_DB]
                 logger.info(f"Connected to MongoDB: {MONGODB_DB}")
             except PyMongoError as e:
@@ -71,7 +80,12 @@ def execute_find(collection: str, filter_dict: dict,
         # Auto-add soft delete filter
         filter_dict = _add_soft_delete(collection, filter_dict)
 
-        cursor = db[collection].find(filter_dict, projection, max_time_ms=MAX_MONGO_TIME_MS)
+        cursor = _mongo_call(
+            lambda: db[collection].find(filter_dict, projection, max_time_ms=MAX_MONGO_TIME_MS),
+            fallback=None
+        )
+        if cursor is None:
+            return []
         if sort:
             cursor = cursor.sort(sort)
         if skip:
@@ -105,9 +119,14 @@ def execute_aggregate(collection: str, pipeline: list) -> List[Dict]:
         # Ensure soft-delete filters are always applied when configured
         pipeline = _inject_soft_delete_match(collection, pipeline)
 
-        cursor = db[collection].aggregate(
-            pipeline, allowDiskUse=True, maxTimeMS=MAX_MONGO_TIME_MS
+        cursor = _mongo_call(
+            lambda: db[collection].aggregate(
+                pipeline, allowDiskUse=True, maxTimeMS=MAX_MONGO_TIME_MS
+            ),
+            fallback=None
         )
+        if cursor is None:
+            return []
         results = [_serialize_doc(doc) for doc in cursor]
 
         logger.info(f"aggregate({collection}) -> {len(results)} docs, pipeline stages: {len(pipeline)}")
@@ -134,7 +153,10 @@ def execute_count(collection: str, filter_dict: dict) -> int:
     try:
         filter_dict = _normalize_query_literals(filter_dict)
         filter_dict = _add_soft_delete(collection, filter_dict)
-        count = db[collection].count_documents(filter_dict, maxTimeMS=MAX_MONGO_TIME_MS)
+        count = _mongo_call(
+            lambda: db[collection].count_documents(filter_dict, maxTimeMS=MAX_MONGO_TIME_MS),
+            fallback=0
+        )
         logger.info(f"count({collection}) -> {count}")
         record_event("mongo_query", {"operation": "count", "collection": collection, "rows": count})
         return count
@@ -155,7 +177,10 @@ def execute_distinct(collection: str, field: str,
     try:
         filter_dict = _normalize_query_literals(filter_dict or {})
         filter_dict = _add_soft_delete(collection, filter_dict or {})
-        results = db[collection].distinct(field, filter_dict, maxTimeMS=MAX_MONGO_TIME_MS)
+        results = _mongo_call(
+            lambda: db[collection].distinct(field, filter_dict, maxTimeMS=MAX_MONGO_TIME_MS),
+            fallback=[]
+        )
         logger.info(f"distinct({collection}.{field}) -> {len(results)} values")
         record_event("mongo_query", {"operation": "distinct", "collection": collection, "rows": len(results)})
         return results

@@ -147,6 +147,8 @@ class ResponseController:
                 or "Collection:" in stripped_r
                 or "Query:" in stripped_r
                 or "Total count:" in stripped_r
+                or "Total:" in stripped_r
+                or "Conversion Rate:" in stripped_r
                 or re.match(r'^\d[\d,\.]+\s*$', stripped_r) is None
             )
             if not _already_labeled:
@@ -245,12 +247,12 @@ class ResponseController:
         ]
         for pattern in no_patterns:
             if re.search(pattern, text.lower()):
-                return "0"
+                return "Total: 0"
 
         # Extract first number (integer or float)
         match = re.search(r'\b(\d+(?:,\d{3})*(?:\.\d+)?)\b', text)
         if match:
-            return match.group(1)
+            return f"Total: {match.group(1)}"
 
         # Written numbers
         written = {
@@ -260,7 +262,7 @@ class ResponseController:
         }
         for word, num in written.items():
             if re.search(rf'\b{word}\b', text.lower()):
-                return num
+                return f"Total: {num}"
 
         # Cannot extract — return original response unchanged
         logger.warning(

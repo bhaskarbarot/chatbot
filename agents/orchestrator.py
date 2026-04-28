@@ -184,6 +184,7 @@ class ChatOrchestrator:
         start_time = time.time()
         self.logs = []
         self._current_query = user_query
+        _validation_meta = {"needs_self_healing": False}
         self._log("Received query", user_query)
 
         try:
@@ -744,7 +745,7 @@ class ChatOrchestrator:
             # === ENHANCEMENT 7: Self-healing retry (after ALL existing fallbacks) ===
             # FIX 3: Skip self-healing if already over 22s to stay under 30s budget
             _elapsed_before_heal = time.time() - start_time
-            if _elapsed_before_heal > 22.0 and _validation_meta:
+            if _elapsed_before_heal > 22.0:
                 _validation_meta["needs_self_healing"] = False
                 logger.info(
                     f"[TimeBudget] Skipping self-healing: "
@@ -752,6 +753,7 @@ class ChatOrchestrator:
                 )
             if (
                 self._is_empty_result(data)
+                and _elapsed_before_heal <= 22.0
                 and enriched_intent.get("primary_intent") != "existence_check"
                 and enriched_intent.get("primary_intent") != "greeting"
                 and enriched_intent.get("response_shape") != "yes_no"
@@ -1233,7 +1235,7 @@ class ChatOrchestrator:
                     ),
                 )
                 response = (
-                    f"Yes, found {count} record(s) matching '{target}' in {collection}.\n"
+                    f"Yes, I found {count} records matching '{target}' in {collection}.\n"
                     f"{data_response}"
                 )
                 response = mask_response(response)
@@ -1357,7 +1359,7 @@ class ChatOrchestrator:
 
         # Build response
         lines = [
-            f"Found {len(matched)} groups to compare | "
+            f"Here are {len(matched)} groups to compare | "
             f"Field: {group_field} | Collection: {collection}",
             f"Query echo -> Entities: {' vs '.join(entities)} | Total records: {total_all}",
             f"Comparison Results:",
@@ -1367,7 +1369,7 @@ class ChatOrchestrator:
         for ent, cnt in matched.items():
             pct = (cnt / total_all) * 100
             pcts.append(pct)
-            lines.append(f"  {ent}: {cnt} record(s) ({pct:.1f}%)")
+            lines.append(f"  {ent}: {cnt} records ({pct:.1f}%)")
 
         if len(pcts) == 2:
             diff = abs(pcts[0] - pcts[1])
@@ -2240,9 +2242,7 @@ class ChatOrchestrator:
             )
             return self._build_result(response, start_time, format_type="not_found", collection="meetings")
 
-        prefix = (
-            f"Found {len(data)} meeting record(s) | Filter: date = '{date_label}' | Collection: meetings"
-        )
+        prefix = f"Here are {len(data)} meeting records for {date_label}:"
         body = auto_format(data, user_query, "list", response_meta=self._build_response_meta(plan, user_query, data))
         response = f"{prefix}\n{body}"
         self.memory.add_exchange(user_query, response, collection="meetings")
@@ -2306,10 +2306,8 @@ class ChatOrchestrator:
             response = f"No {child_type} records are linked to '{parent_name}'."
             return self._build_result(response, start_time, format_type="not_found", collection=child_collection)
 
-        prefix = (
-            f"Found {len(data)} {child_type} record(s) | "
-            f"Linked to: {parent_type} = '{parent_name}' | Collection: {child_collection}"
-        )
+        child_label = child_type.title() if child_type else "Record"
+        prefix = f"Here are {len(data)} linked {child_label.lower()} records for {parent_type} '{parent_name}':"
         body = auto_format(data, user_query, "list", response_meta=self._build_response_meta(plan, user_query, data))
         response = f"{prefix}\n{body}"
         self.memory.add_exchange(user_query, response, collection=child_collection)
@@ -3028,7 +3026,7 @@ class ChatOrchestrator:
         # Build clean response
         field_label = re.sub(r"([A-Z])", r" \1", fk_field).strip().title()
         lines = [
-            f"Found {len(records)} {collection} record(s) | Filter: company = '{company_name}' | Collection: {collection}",
+            f"Here are {len(records)} {collection.rstrip('s')} records for company '{company_name}':",
             f"Query echo -> Entity: {collection} | Field resolved: {fk_field} → users | Returned: {len(records)} records",
             f"{field_label} for {company_name}'s {collection}:",
             "",
@@ -3190,7 +3188,7 @@ class ChatOrchestrator:
 
         # Build response
         lines = [
-            f"Found {len(agg_data)} owner(s) | Field: {owner_field} | Collection: {collection}",
+            f"Here are {len(agg_data)} owners | Field: {owner_field} | Collection: {collection}",
             f"Query echo -> Entity: {collection} owner | Returned: {len(agg_data)} unique owners",
             f"Owner names for {collection}:",
             "",
@@ -3303,9 +3301,8 @@ class ChatOrchestrator:
         q = user_query.lower()
         category_field = _humanize_field(self._infer_category_field(collection, q))
         echo_line = (
-            f"Found {total_count} {collection.rstrip('s')} record(s) | "
-            f"Filter applied: {self._infer_base_filter(collection, q) or 'none'} | "
-            f"Collection: {collection}"
+            f"Here are {total_count} {collection.rstrip('s')} records "
+            f"from the CRM (filters: {self._infer_base_filter(collection, q) or 'none'})."
         )
 
         if format_hint == "table":
@@ -3339,7 +3336,7 @@ class ChatOrchestrator:
 
         lines = [
             echo_line,
-            f"Summary: Found {total_count} {collection} record(s) matching your query.",
+            f"Summary: {total_count} {collection} records match your query.",
             f"Filtered from the ECRM {collection} module per your request.",
             f"Category breakdown and analysis shown below.\n",
             f"Total {collection}: {total_count}",
