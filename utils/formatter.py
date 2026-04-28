@@ -255,28 +255,189 @@ def format_aggregation(data: List[Dict], query: str,
     return "\n".join(lines)
 
 
+def _wrap_number_response(value, query: str, collection: str = "") -> str:
+    """
+    Never return a bare number. Always include context.
+    """
+    if isinstance(value, float):
+        formatted = f"{value:,.2f}"
+    elif isinstance(value, int):
+        formatted = f"{value:,}"
+    else:
+        formatted = str(value)
+
+    response_lines = [
+        f"Total count: **{formatted}**",
+        f"Collection: {collection or 'N/A'}",
+        f"Query: {query[:80]}"
+    ]
+    return "\n".join(response_lines)
+
+
 def auto_format(data: Any, query: str, format_hint: str = "auto",
-                response_meta: Optional[Dict[str, Any]] = None) -> str:
-    """Automatically choose and apply the best format."""
+                response_meta: Optional[Dict[str, Any]] = None,
+                shape_instructions: Optional[Dict] = None,
+                validation_meta: Optional[Dict] = None) -> str:
+    """Automatically choose and apply the best format.
+
+    shape_instructions (optional, from ResponseController):
+      {"shape": str, "max_items": int|None, "system_prefix": str}
+    When provided, shape overrides format_hint and max_items trims the data.
+    """
+    si = shape_instructions or {}
+    vm = validation_meta or {}
+
+    # === EARLY EXIT: Aggregate numeric result ===
+    if si.get("shape") in ("number", "count") or \
+       vm.get("shape_applied") in (
+           "aggregate_number", "direct_count", "number_from_list"):
+
+        # Case 1: Aggregate with extracted value
+        agg = vm.get("aggregate_value", {})
+        if agg.get("extracted"):
+            value = agg["value"]
+            label = agg["label"].replace("_", " ").title()
+            strategy = agg.get("strategy", "")
+            all_fields = agg.get("all_fields", {})
+
+            # Format value
+            if isinstance(value, float) and value != int(value):
+                fval = f"{value:,.2f}"
+            else:
+                fval = f"{int(value):,}"
+
+            # Multi-field summary
+            if len(all_fields) > 1:
+                lines = [f"**Summary**"]
+                for k, v in all_fields.items():
+                    lbl = k.replace("_", " ").title()
+                    if isinstance(v, float) and v != int(v):
+                        lines.append(f"  • {lbl}: {v:,.2f}")
+                    else:
+                        lines.append(f"  • {lbl}: {int(v):,}")
+                if strategy == "summed_multi_doc":
+                    lines.append(
+                        f"  _(calculated from "
+                        f"{agg.get('doc_count', '?')} records)_"
+                    )
+                if si.get("heal_note"):
+                    lines.append(f"\n_{si['heal_note']}_")
+                return "\n".join(lines)
+
+            # Single value summary
+            result = f"**{label}:** {fval}"
+            if strategy == "summed_multi_doc":
+                result += (
+                    f"\n_(calculated from "
+                    f"{agg.get('doc_count', '?')} records)_"
+                )
+            if si.get("heal_note"):
+                result += f"\n_{si['heal_note']}_"
+            return result
+
+        # Case 2: Direct count integer
+        count_val = vm.get("count_value")
+        if count_val is not None:
+            # Use _wrap_number_response
+            collection = response_meta.get("collection", "") \
+                if response_meta else ""
+            result = _wrap_number_response(count_val, query, collection)
+            if si.get("heal_note"):
+                result += f"\n_{si['heal_note']}_"
+            return result
+
+        # Case 3: Data is a bare integer/float (direct count result)
+        if isinstance(data, (int, float)) and not isinstance(data, bool):
+            collection = response_meta.get("collection", "") \
+                if response_meta else ""
+            result = _wrap_number_response(data, query, collection)
+            if si.get("heal_note"):
+                result += f"\n_{si['heal_note']}_"
+            return result
+
+    # Apply shape_instructions from ResponseController if provided
+    if shape_instructions and isinstance(shape_instructions, dict):
+        si_shape = shape_instructions.get("shape")
+        si_max   = shape_instructions.get("max_items")
+
+        # Override format_hint with shape instruction
+        if si_shape and si_shape not in ("auto", "list"):
+            _shape_to_hint = {
+                "number": "count", "yes_no": "count", "single_value": "detail",
+                "table": "table", "analysis_text": "summary",
+            }
+            format_hint = _shape_to_hint.get(si_shape, format_hint)
+
+        # Pre-trim list data to max_items before formatting
+        if si_max is not None and isinstance(data, list) and len(data) > si_max:
+            data = data[:si_max]
+    else:
+        si_shape = None
+
     if format_hint == "auto":
         format_hint = detect_format_intent(query)
 
+    aggregate_value = (validation_meta or {}).get("aggregate_value", {})
+    if (
+        si_shape in ("number", "count")
+        and isinstance(aggregate_value, dict)
+        and aggregate_value.get("extracted")
+    ):
+        value = aggregate_value["value"]
+        label = aggregate_value["label"].replace("_", " ").title()
+        all_fields = aggregate_value.get("all_fields", {})
+        if isinstance(value, float) and value != int(value):
+            formatted_value = f"{value:,.2f}"
+        else:
+            formatted_value = f"{int(value):,}"
+
+        if len(all_fields) > 1:
+            lines = []
+            for k, v in all_fields.items():
+                field_label = k.replace("_", " ").title()
+                if isinstance(v, float) and v != int(v):
+                    lines.append(f"  • {field_label}: {v:,.2f}")
+                else:
+                    lines.append(f"  • {field_label}: {int(v):,}")
+            response = "\n".join(lines)
+        else:
+            response = f"{label}: {formatted_value}"
+        if shape_instructions and shape_instructions.get("heal_note"):
+            response = response + f"\n\n_{shape_instructions['heal_note']}_"
+        return response
+
     if isinstance(data, (int, float)):
-        return format_as_count(data, query, response_meta=response_meta)
+        response = format_as_count(data, query, response_meta=response_meta)
+        if len(response.strip()) < 30:
+            response = _wrap_number_response(
+                data, query, (response_meta or {}).get("collection", "")
+            )
+        if shape_instructions and shape_instructions.get("heal_note"):
+            response = response + f"\n\n_{shape_instructions['heal_note']}_"
+        return response
 
     if isinstance(data, dict):
         if any(k in data for k in ["count", "total", "total_revenue_usd",
                                     "totalRevenue", "invoice_count"]):
-            return format_as_count(data, query, response_meta=response_meta)
+            response = format_as_count(data, query, response_meta=response_meta)
+            if shape_instructions and shape_instructions.get("heal_note"):
+                response = response + f"\n\n_{shape_instructions['heal_note']}_"
+            return response
         data = [data]
 
     if not isinstance(data, list):
-        return str(data)
+        response = str(data)
+        if shape_instructions and shape_instructions.get("heal_note"):
+            response = response + f"\n\n_{shape_instructions['heal_note']}_"
+        return response
 
     if len(data) == 0:
         lines = _executive_summary_lines([], query, response_meta=response_meta)
         lines.append("No results found for your query.")
-        return "\n".join(lines)
+        response = "\n".join(lines)
+        if shape_instructions and shape_instructions.get("heal_note"):
+            response = response + f"\n\n_{shape_instructions['heal_note']}_"
+        return response
 
     # Detect aggregation results (dicts with _id field throughout)
     is_aggregation = (
@@ -287,25 +448,47 @@ def auto_format(data: Any, query: str, format_hint: str = "auto",
         and not any(k in data[0] for k in {"createdAt", "updatedAt", "email", "phoneNumber"})
     )
     if is_aggregation:
-        return format_aggregation(data, query, response_meta=response_meta)
+        response = format_aggregation(data, query, response_meta=response_meta)
+        if shape_instructions and shape_instructions.get("heal_note"):
+            response = response + f"\n\n_{shape_instructions['heal_note']}_"
+        return response
 
     masked_data = [mask_dict(r) if isinstance(r, dict) else r for r in data]
 
     if format_hint == "count":
-        return format_as_count(len(masked_data), query, response_meta=response_meta)
+        response = format_as_count(len(masked_data), query, response_meta=response_meta)
     elif format_hint == "table":
-        return format_as_table(masked_data, query, response_meta=response_meta)
+        response = format_as_table(masked_data, query, response_meta=response_meta)
     elif format_hint == "list":
-        return format_as_list(masked_data, query, response_meta=response_meta)
+        response = format_as_list(masked_data, query, response_meta=response_meta)
     elif format_hint == "detail":
-        return format_as_detail(masked_data, query, response_meta=response_meta)
+        response = format_as_detail(masked_data, query, response_meta=response_meta)
     elif format_hint == "summary":
-        return format_as_summary(masked_data, query, response_meta=response_meta)
+        response = format_as_summary(masked_data, query, response_meta=response_meta)
     else:
         if len(masked_data) <= 5:
-            return format_as_summary(masked_data, query, response_meta=response_meta)
+            response = format_as_summary(masked_data, query, response_meta=response_meta)
         else:
-            return format_as_list(masked_data, query, response_meta=response_meta)
+            response = format_as_list(masked_data, query, response_meta=response_meta)
+
+    if response and len(response.strip()) < 20:
+        if isinstance(data, list) and len(data) > 0:
+            response = f"Found {len(data)} record(s):\n" + \
+                "\n".join(str(r) for r in data[:10])
+        elif isinstance(data, (int, float)):
+            response = str(data)
+
+    if (
+        isinstance(data, (int, float))
+        and len((response or "").strip()) < 30
+    ):
+        response = _wrap_number_response(
+            data, query, (response_meta or {}).get("collection", "")
+        )
+
+    if shape_instructions and shape_instructions.get("heal_note"):
+        response = response + f"\n\n_{shape_instructions['heal_note']}_"
+    return response
 
 
 # ── Executive Summary ────────────────────────────────

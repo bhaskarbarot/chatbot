@@ -31,6 +31,7 @@ from utils.formatter import (
 )
 from utils.masking import mask_response
 from utils.metrics import record_event
+import utils.metrics as metrics
 from utils.cache import ResponseCache
 from utils.circuit_breaker import get_llm_breaker
 from knowledge.intent_classifier import (
@@ -53,6 +54,70 @@ from tools.mongodb_tool import (execute_query_plan, search_by_keyword,
                                  resolve_name_to_id, get_collection_sample)
 
 logger = get_logger("orchestrator")
+
+# ── Enhancement layer singletons (all wrapped — safe to import at startup) ───
+try:
+    from knowledge.deep_query_understander import DeepQueryUnderstander as _DQUClass
+    _deep_understander = _DQUClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] DeepQueryUnderstander unavailable: {_enh_e}")
+    _deep_understander = None
+
+try:
+    from knowledge.intent_enricher import IntentEnricher as _IEClass
+    _intent_enricher = _IEClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] IntentEnricher unavailable: {_enh_e}")
+    _intent_enricher = None
+
+try:
+    from memory.enhanced_memory_resolver import EnhancedMemoryResolver as _EMRClass
+    _enhanced_memory = _EMRClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] EnhancedMemoryResolver unavailable: {_enh_e}")
+    _enhanced_memory = None
+
+try:
+    from agents.structured_plan_wrapper import StructuredPlanWrapper as _SPWClass
+    _plan_wrapper = _SPWClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] StructuredPlanWrapper unavailable: {_enh_e}")
+    _plan_wrapper = None
+
+try:
+    from knowledge.relationship_enhancer import RelationshipEnhancer as _REClass
+    _rel_enhancer = _REClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] RelationshipEnhancer unavailable: {_enh_e}")
+    _rel_enhancer = None
+
+try:
+    from agents.response_validator import ResponseValidator as _RVClass
+    _validator = _RVClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] ResponseValidator unavailable: {_enh_e}")
+    _validator = None
+
+try:
+    from agents.self_healing_agent import SelfHealingAgent as _SHAClass
+    _healer = _SHAClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] SelfHealingAgent unavailable: {_enh_e}")
+    _healer = None
+
+try:
+    from utils.response_controller import ResponseController as _RCClass
+    _response_controller = _RCClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] ResponseController unavailable: {_enh_e}")
+    _response_controller = None
+
+try:
+    from agents.query_decomposer import QueryDecomposer as _QDClass
+    _decomposer = _QDClass()
+except Exception as _enh_e:
+    logger.warning(f"[Orchestrator] QueryDecomposer unavailable: {_enh_e}")
+    _decomposer = None
 
 
 class ChatOrchestrator:
@@ -96,20 +161,53 @@ class ChatOrchestrator:
         self._log("Received query", user_query)
 
         try:
-            # Step 0: Greetings
-            if self._is_greeting(user_query):
-                response = build_greeting_response(user_query)
-                return self._build_result(response, start_time, format_type="greeting")
+            # Pre-check: detect follow-up reference patterns BEFORE scope check
+            # These patterns always indicate a follow-up — never out-of-scope
+            FOLLOWUP_OVERRIDE_PATTERNS = [
+                r'\b(those|them|they|these)\b',
+                r'\b(that one|this one|the same)\b',
+                r'\b(of those|from those|in those|among those)\b',
+                r'\b(how many of|which of|filter those|sort those)\b',
+            ]
+            import re as _re
+            _is_followup_override = any(
+                _re.search(p, user_query.lower())
+                for p in FOLLOWUP_OVERRIDE_PATTERNS
+            )
+            _has_memory_context = False
+            if hasattr(self.memory, "get_last_topic"):
+                _has_memory_context = bool(self.memory.get_last_topic())
+            elif hasattr(self.memory, "exchanges"):
+                _has_memory_context = bool(len(getattr(self.memory, "exchanges", [])) > 0)
 
-            # Step 1: Out-of-scope
-            if self._is_out_of_scope(user_query):
-                response = build_out_of_scope_response(user_query)
-                return self._build_result(response, start_time, format_type="out_of_scope")
+            if not (_is_followup_override and _has_memory_context):
+                # Step 0: Greetings
+                if self._is_greeting(user_query):
+                    response = build_greeting_response(user_query)
+                    return self._build_result(response, start_time, format_type="greeting")
+
+                # Step 1: Out-of-scope
+                if self._is_out_of_scope(user_query):
+                    response = build_out_of_scope_response(user_query)
+                    return self._build_result(response, start_time, format_type="out_of_scope")
 
             # Step 2: Follow-up resolution using memory
             resolved_query, is_followup = self.memory.resolve_followup(user_query)
             if is_followup:
                 self._log("Follow-up resolved", f"'{user_query}' -> '{resolved_query}'")
+
+            # === ENHANCEMENT 9: Enhanced memory resolution ===
+            _resolved_context = {}
+            try:
+                if _enhanced_memory is not None:
+                    resolved_query, is_followup, _resolved_context = \
+                        _enhanced_memory.resolve(resolved_query, self.memory)
+                    if _resolved_context:
+                        self._log("EnhancedMemory",
+                                  f"strategy={_resolved_context.get('_strategy')}")
+            except Exception as _enh_e:
+                logger.warning(f"[EnhancedMemory.resolve] failed: {_enh_e}")
+                _resolved_context = {}
 
             # Step 2.1: Deep query understanding — extract intent, limit, sort, entities
             qparams = understand_query(resolved_query)
@@ -124,6 +222,19 @@ class ChatOrchestrator:
                 "sort_reason": qparams.sort_reason,
                 "collection_hints": qparams.collection_hints[:3],
             })
+
+            # === ENHANCEMENT 1: Deep query understanding ===
+            deep_understanding = {}
+            try:
+                if _deep_understander is not None:
+                    deep_understanding = _deep_understander.understand(resolved_query)
+                    self._log("DeepUnderstander",
+                              f"shape={deep_understanding.get('response_shape')} "
+                              f"limit={deep_understanding.get('result_limit')} "
+                              f"temporal={deep_understanding.get('temporal_filter', {}).get('type')}")
+            except Exception as _enh_e:
+                logger.warning(f"[DeepUnderstander] failed: {_enh_e}")
+                deep_understanding = {}
 
             # Step 2.1b: Context matching
             if not is_followup and self.memory.short_term:
@@ -184,22 +295,38 @@ class ChatOrchestrator:
             # Step 3.1: Redis semantic cache lookup
             cache_hit = self.cache.get_best(resolved_query)
             if cache_hit and isinstance(cache_hit.payload, dict):
-                self._log("Cache hit", f"score={cache_hit.score:.2f}")
                 cached_response = cache_hit.payload.get("response")
                 if cached_response:
-                    entity = cache_hit.payload.get("entity")
-                    collection = cache_hit.payload.get("collection")
-                    fmt = cache_hit.payload.get("format", format_hint)
-                    self.memory.add_exchange(
-                        user_query, cached_response, entity=entity, collection=collection
+                    logger.info(
+                        f"[Cache] Hit for query='{user_query[:50]}' "
+                        f"response_preview='{str(cached_response)[:30]}'"
                     )
-                    return self._build_result(
-                        cached_response,
-                        start_time,
-                        format_type=fmt,
-                        entity=entity,
-                        collection=collection,
+                    cached_text = str(cached_response).strip()
+                    import re as _re_cache
+                    _numeric_only = bool(
+                        _re_cache.match(r'^[\d,\.\s]+$', cached_text)
                     )
+                    _is_bad_cache = _numeric_only and len(cached_text) < 30
+                    if _is_bad_cache:
+                        logger.info(
+                            f"[Cache] Bypassing bad numeric cache: "
+                            f"'{cached_text[:20]}'"
+                        )
+                    else:
+                        self._log("Cache hit", f"score={cache_hit.score:.2f}")
+                        entity = cache_hit.payload.get("entity")
+                        collection = cache_hit.payload.get("collection")
+                        fmt = cache_hit.payload.get("format", format_hint)
+                        self.memory.add_exchange(
+                            user_query, cached_response, entity=entity, collection=collection
+                        )
+                        return self._build_result(
+                            cached_response,
+                            start_time,
+                            format_type=fmt,
+                            entity=entity,
+                            collection=collection,
+                        )
 
             # Step 2.5: Parallel intent pipeline for analysis/category/breakdown queries
             parallel_result = self._parallel_intent_pipeline(
@@ -217,6 +344,53 @@ class ChatOrchestrator:
 
             # Step 3.5: Intent pre-classifier fast-path (LLM bypass for clear intents)
             intent, conf = classify_intent(resolved_query)
+
+            # === ENHANCEMENT 2: Intent enrichment ===
+            enriched_intent = {}
+            try:
+                if _intent_enricher is not None:
+                    enriched_intent = _intent_enricher.enrich(
+                        (intent, conf), qparams, deep_understanding
+                    )
+                    self._log("EnrichedIntent",
+                              f"output_type={enriched_intent.get('output_type')} "
+                              f"multi={enriched_intent.get('is_multi_intent')} "
+                              f"limit={enriched_intent.get('result_limit')}")
+            except Exception as _enh_e:
+                logger.warning(f"[IntentEnricher] failed: {_enh_e}")
+                enriched_intent = {}
+
+            # === ENHANCEMENT 3: Query decomposition (multi-intent only) ===
+            # Runs only when deep understander flagged is_multi_intent=True.
+            # Uses sequential plan building + parallel MongoDB execution.
+            # Sets _decomposition_handled to prevent double-decomposition.
+            _decomposition_handled = False
+            if enriched_intent.get("is_multi_intent") and _decomposer is not None:
+                try:
+                    _decomposed = _decomposer.decompose_and_execute(
+                        resolved_query,
+                        enriched_intent,
+                        lambda _q, _r, _c: plan_query(_q, _r, _c),
+                        execute_query_plan,
+                        lambda _d, _q: auto_format(_d, _q, "auto"),
+                    )
+                    if _decomposed:
+                        _decomposition_handled = True
+                        _decomposed = mask_response(_decomposed)
+                        self.memory.add_exchange(user_query, _decomposed)
+                        try:
+                            if _enhanced_memory is not None:
+                                _enhanced_memory.store_context_async(enriched_intent, [])
+                        except Exception:
+                            pass
+                        return self._build_result(
+                            _decomposed, start_time, format_type="summary"
+                        )
+                except Exception as _enh_e:
+                    logger.warning(
+                        f"[QueryDecomposer] failed: {_enh_e}. Continuing as single query."
+                    )
+
             if intent != Intent.UNKNOWN and conf >= CONFIDENCE_THRESHOLD:
                 collection_hint = get_intent_collection(intent, resolved_query)
                 if collection_hint:
@@ -363,6 +537,10 @@ class ChatOrchestrator:
             self._log("Query plan",
                       f"type={query_plan.get('type')}, "
                       f"collection={query_plan.get('collection', 'multi')}")
+            logger.info(
+                f"[PlanCollection] query='{user_query[:40]}' "
+                f"collection='{query_plan.get('collection', 'unknown')}'"
+            )
 
             query_plan = self._apply_business_intent_overrides(resolved_query, query_plan)
             query_plan = self._apply_entity_constraints(resolved_query, query_plan)
@@ -385,6 +563,28 @@ class ChatOrchestrator:
                     query_plan, qparams.sort_field, qparams.sort_direction,
                     qparams.sort_reason
                 )
+
+            # === ENHANCEMENT 4: Structured plan wrapper ===
+            _wrapped_plan = {"original_plan": query_plan}
+            try:
+                if _plan_wrapper is not None and query_plan:
+                    _wrapped_plan = _plan_wrapper.wrap(query_plan, enriched_intent)
+                    self._log("PlanWrapper",
+                              f"shape_contract={_wrapped_plan.get('response_shape_contract')} "
+                              f"enforced_limit={_wrapped_plan.get('enforced_limit')}")
+            except Exception as _enh_e:
+                logger.warning(f"[PlanWrapper] failed: {_enh_e}")
+                _wrapped_plan = {"original_plan": query_plan}
+
+            # === ENHANCEMENT 5: Relationship enhancement ===
+            try:
+                if (_rel_enhancer is not None
+                        and enriched_intent.get("needs_relationship_join")):
+                    _wrapped_plan = _rel_enhancer.enhance(_wrapped_plan, enriched_intent)
+                    self._log("RelEnhancer",
+                              f"join_hints={len(_wrapped_plan.get('join_hints', []))}")
+            except Exception as _enh_e:
+                logger.warning(f"[RelEnhancer] failed: {_enh_e}")
 
             # Step 6: Execute query
             self._log("Executing query", "...")
@@ -476,12 +676,77 @@ class ChatOrchestrator:
                     data = date_retry_data
                     query_plan = date_retry_plan
 
+            shape_instructions = {}
+            # === ENHANCEMENT 7: Self-healing retry (after ALL existing fallbacks) ===
+            if (
+                self._is_empty_result(data)
+                and enriched_intent.get("primary_intent") != "existence_check"
+                and enriched_intent.get("primary_intent") != "greeting"
+                and enriched_intent.get("response_shape") != "yes_no"
+            ):
+                try:
+                    if _healer is not None and enriched_intent:
+                        healed = _healer.heal(
+                            original_query=resolved_query,
+                            enriched_intent=enriched_intent,
+                            plan=query_plan,
+                            mongo_execute_fn=execute_query_plan,
+                            query_planner_fn=lambda _q, _r, _c: plan_query(_q, _r, _c),
+                        )
+                        if (healed is not None
+                                and not (isinstance(healed, dict)
+                                         and healed.get("healing_failed"))):
+                            if isinstance(healed, dict) and healed.get("healed"):
+                                data = healed.get("data", data)
+                                heal_note = healed.get("heal_note", "")
+                                if not shape_instructions:
+                                    shape_instructions = {}
+                                shape_instructions["heal_note"] = heal_note
+                                self._log(
+                                    "SelfHealing",
+                                    f"strategy={healed.get('strategy')} note={heal_note}",
+                                )
+                            else:
+                                data = healed
+                                self._log("SelfHealing", "Self-healer recovered results")
+                        else:
+                            self._log("SelfHealing", "All healing attempts exhausted")
+                except Exception as _enh_e:
+                    logger.warning(f"[SelfHealer] failed: {_enh_e}")
+
             if self._is_empty_result(data):
                 collection = query_plan.get("collection", "")
                 response = build_not_found_response(resolved_query, collection)
                 return self._build_result(response, start_time,
                                           format_type="not_found",
                                           collection=collection)
+
+            # === ENHANCEMENT 6: Response validation (shape/limit enforcement) ===
+            _validation_meta = {}
+            try:
+                if _validator is not None and enriched_intent:
+                    data, _validation_meta = _validator.validate(data, enriched_intent)
+                    self._log("Validator",
+                              f"shape={_validation_meta.get('shape_applied')} "
+                              f"count={_validation_meta.get('validated_count')}")
+            except Exception as _enh_e:
+                logger.warning(f"[ResponseValidator] failed: {_enh_e}")
+                _validation_meta = {}
+
+            # === ENHANCEMENT 8: Response controller — get shape instructions ===
+            _shape_instructions = {}
+            try:
+                if _response_controller is not None and enriched_intent:
+                    _shape_instructions = _response_controller.get_instructions(
+                        enriched_intent
+                    )
+                if shape_instructions:
+                    if not isinstance(_shape_instructions, dict):
+                        _shape_instructions = {}
+                    _shape_instructions.update(shape_instructions)
+            except Exception as _enh_e:
+                logger.warning(f"[ResponseController.get_instructions] failed: {_enh_e}")
+                _shape_instructions = {}
 
             # Step 8: Format response
             self._log("Formatting response", format_hint)
@@ -501,7 +766,18 @@ class ChatOrchestrator:
                     user_query,
                     response_hint,
                     response_meta=self._build_response_meta(query_plan, user_query, data),
+                    shape_instructions=_shape_instructions,
+                    validation_meta=_validation_meta,
                 )
+
+            # === ENHANCEMENT 8: Post-formatter shape correction ===
+            try:
+                if _response_controller is not None and enriched_intent:
+                    response = _response_controller.correct_shape(
+                        response, enriched_intent
+                    )
+            except Exception as _enh_e:
+                logger.warning(f"[ResponseController.correct_shape] failed: {_enh_e}")
 
             # Step 9: Masking
             response = mask_response(response)
@@ -514,6 +790,38 @@ class ChatOrchestrator:
             self.memory.add_exchange(
                 user_query, response, entity=entity, collection=collection
             )
+
+            # === ENHANCEMENT 9: Store structured context (async, non-blocking) ===
+            try:
+                if _enhanced_memory is not None and enriched_intent:
+                    _raw_for_store = data if isinstance(data, list) else []
+                    _enhanced_memory.store_context_async(enriched_intent, _raw_for_store)
+            except Exception as _enh_e:
+                logger.warning(f"[EnhancedMemory.store_context_async] failed: {_enh_e}")
+
+            # After all layers complete, record enhancement metrics
+            try:
+                validation_meta = _validation_meta
+                shape_instructions = _shape_instructions
+                metrics.increment("queries.total")
+
+                if deep_understanding.get("response_shape") != "auto":
+                    metrics.increment("deep_understander.active")
+
+                if enriched_intent.get("is_multi_intent"):
+                    metrics.increment("decomposer.triggered")
+
+                if validation_meta.get("needs_self_healing"):
+                    metrics.increment("self_healing.triggered")
+
+                if not deep_understanding:  # fallback was used
+                    metrics.increment("deep_understander.fallback_used")
+
+                if shape_instructions.get("heal_note"):
+                    metrics.increment("self_healing.succeeded")
+
+            except Exception:
+                pass  # never block main flow for metrics
 
             return self._build_result(response, start_time,
                                       format_type=response_hint,
@@ -1221,6 +1529,8 @@ class ChatOrchestrator:
 
     def _is_out_of_scope(self, query: str) -> bool:
         q = query.lower()
+        if re.search(r"\b(those|these|that|them|same)\b", q):
+            return False
         out_of_scope_patterns = [
             r"what is (?:machine learning|ai|python|java|react)",
             r"(?:tell|teach) me about (?:programming|coding|science|history)",
