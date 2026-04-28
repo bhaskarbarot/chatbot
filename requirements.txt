@@ -10,8 +10,11 @@ sentence-transformers>=2.2.0
 # MongoDB
 pymongo>=4.6.0
 
-# Streamlit UI
+# Streamlit UI (kept but not used as primary UI)
 streamlit>=1.38.0
+
+# Flask server (serves React chat-ui)
+flask>=3.0.0
 
 # Utilities
 python-dotenv>=1.0.0

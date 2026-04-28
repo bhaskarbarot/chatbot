@@ -36,8 +36,8 @@ _DATE_FIELD_ALIASES: List[str] = [
     "leadWonAt", "leadLostAt", "closedDate", "startDate", "endDate",
 ]
 
-_TOTAL_BUDGET_S = 15.0
-_PER_ATTEMPT_BUDGET_S = 8.0
+_TOTAL_BUDGET_S = 12.0        # FIX 3: reduced from 15s so total stays <30s
+_PER_ATTEMPT_BUDGET_S = 5.0  # FIX 3: reduced from 8s; LLM replan must be fast
 
 
 class SelfHealingAgent:
@@ -60,7 +60,6 @@ class SelfHealingAgent:
         or a graceful failure dict on exhaustion.
         Never raises.
         """
-        print(f"[HEAL DEBUG] triggered for: {original_query[:60]}")
         if not plan or not isinstance(plan, dict):
             return self._graceful_failure(original_query, "No valid plan to heal from")
 

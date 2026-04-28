@@ -55,6 +55,32 @@ from tools.mongodb_tool import (execute_query_plan, search_by_keyword,
 
 logger = get_logger("orchestrator")
 
+# ── Entity name cleaning (FIX 1) ─────────────────────────────────────────────
+_NOISE_PREFIXES = [
+    r'^this\s+company\s+', r'^the\s+company\s+', r'^this\s+account\s+',
+    r'^the\s+account\s+', r'^this\s+client\s+', r'^the\s+client\s+',
+    r'^company\s+', r'^account\s+', r'^client\s+',
+    r'^contact\s+', r'^this\s+', r'^the\s+',
+]
+
+
+def _clean_entity_name(raw: str) -> str:
+    """Strip leading noise words captured with entity names."""
+    if not raw:
+        return raw
+    cleaned = raw.strip()
+    for pat in _NOISE_PREFIXES:
+        cleaned = re.sub(pat, '', cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
+# ── Patterns that must never be cached (FIX 6) ───────────────────────────────
+_DONT_CACHE_PATTERNS = [
+    "no company named", "no record found for", "could not find",
+    "i could not find", "healing_failed", "no results found",
+    "no matching records",
+]
+
 # ── Enhancement layer singletons (all wrapped — safe to import at startup) ───
 try:
     from knowledge.deep_query_understander import DeepQueryUnderstander as _DQUClass
@@ -307,11 +333,22 @@ class ChatOrchestrator:
                         _re_cache.match(r'^[\d,\.\s]+$', cached_text)
                     )
                     _is_bad_cache = _numeric_only and len(cached_text) < 30
-                    if _is_bad_cache:
+                    # FIX 6B: also bypass error/not-found cached responses
+                    _cached_lower = cached_text.lower()
+                    _is_error_cache = any(
+                        p in _cached_lower for p in _DONT_CACHE_PATTERNS
+                    )
+                    _is_year_revenue_query = bool(
+                        re.search(r"\b(20\d{2})\b", user_query.lower())
+                        and any(k in user_query.lower() for k in ("revenue", "invoice", "invoices"))
+                    )
+                    if _is_bad_cache or _is_error_cache:
                         logger.info(
-                            f"[Cache] Bypassing bad numeric cache: "
-                            f"'{cached_text[:20]}'"
+                            f"[Cache] Bypassing bad/error cache: "
+                            f"'{cached_text[:40]}'"
                         )
+                    elif _is_year_revenue_query:
+                        logger.info("[Cache] Bypassing cache for year-based revenue query")
                     else:
                         self._log("Cache hit", f"score={cache_hit.score:.2f}")
                         entity = cache_hit.payload.get("entity")
@@ -546,6 +583,9 @@ class ChatOrchestrator:
             query_plan = self._apply_entity_constraints(resolved_query, query_plan)
             query_plan = self._align_plan_with_collection_intent(resolved_query, query_plan)
             query_plan = self._apply_temporal_sort_policy(resolved_query, query_plan)
+            query_plan = self._apply_enriched_intent_constraints(
+                query_plan, enriched_intent, resolved_query
+            )
             # Apply dynamic limit from query understander (overrides LLM default)
             if qparams.limit:
                 if query_plan.get("type") == "find":
@@ -556,6 +596,23 @@ class ChatOrchestrator:
                     pipeline.append({"$limit": qparams.limit})
                     query_plan["pipeline"] = pipeline
                 self._log("Dynamic limit", f"Applied user-specified limit={qparams.limit}")
+            elif query_plan.get("type") in ("find", "aggregate"):
+                # No explicit limit requested by user: do not hard-cap list/table responses.
+                # Keep planner limits only when user intent clearly asks top/last/first N.
+                _q_lower = resolved_query.lower()
+                _has_explicit_n = bool(re.search(
+                    r"\b(top|last|first|latest|oldest|recent)\s+\d+\b|\blimit\s+\d+\b",
+                    _q_lower,
+                ))
+                _shape = (deep_understanding or {}).get("response_shape")
+                if not _has_explicit_n and _shape in ("list", "table"):
+                    if query_plan.get("type") == "find":
+                        query_plan.pop("limit", None)
+                    elif query_plan.get("type") == "aggregate":
+                        query_plan["pipeline"] = [
+                            s for s in query_plan.get("pipeline", [])
+                            if "$limit" not in s
+                        ]
 
             # Apply sort direction from query understander (overrides LLM sort for low/high queries)
             if qparams.sort_field and qparams.sort_reason in ("low_value", "high_value"):
@@ -589,6 +646,12 @@ class ChatOrchestrator:
             # Step 6: Execute query
             self._log("Executing query", "...")
             data = execute_query_plan(query_plan)
+            data = self._post_filter_results_by_intent(
+                data=data,
+                plan=query_plan,
+                enriched_intent=enriched_intent,
+                resolved_query=resolved_query,
+            )
             result_count = self._estimate_result_count(data)
             self._log("Query result", f"{result_count} records")
 
@@ -622,9 +685,10 @@ class ChatOrchestrator:
                         self._log("Verifier", "Corrective replan produced better result")
 
             # Step 7: Empty result handling — max 1 LLM replan to prevent infinite loops
+            # FIX 3: hard cap at 12s to leave budget for formatting + healing
             _replan_attempts = 0
             if self._is_empty_result(data):
-                time_ok = (time.time() - start_time) < max(15, MAX_RESPONSE_TIME * 0.65)
+                time_ok = (time.time() - start_time) < min(12.0, MAX_RESPONSE_TIME * 0.4)
                 if matched_rules and time_ok and _replan_attempts < 1:
                     _replan_attempts += 1
                     self._log("Replan", "No results — retrying with semantic hint")
@@ -678,6 +742,14 @@ class ChatOrchestrator:
 
             shape_instructions = {}
             # === ENHANCEMENT 7: Self-healing retry (after ALL existing fallbacks) ===
+            # FIX 3: Skip self-healing if already over 22s to stay under 30s budget
+            _elapsed_before_heal = time.time() - start_time
+            if _elapsed_before_heal > 22.0 and _validation_meta:
+                _validation_meta["needs_self_healing"] = False
+                logger.info(
+                    f"[TimeBudget] Skipping self-healing: "
+                    f"already {_elapsed_before_heal:.1f}s elapsed"
+                )
             if (
                 self._is_empty_result(data)
                 and enriched_intent.get("primary_intent") != "existence_check"
@@ -1826,6 +1898,13 @@ class ChatOrchestrator:
             start = now - delta_map.get(unit, timedelta(days=30))
             return {field: {"$gte": start.isoformat(), "$lte": now.isoformat()}}
 
+        y_match = re.search(r"\b(20\d{2})\b", query_lower)
+        if y_match:
+            year = int(y_match.group(1))
+            start = datetime(year, 1, 1, 0, 0, 0)
+            end = now if year == now.year else datetime(year, 12, 31, 23, 59, 59)
+            return {field: {"$gte": start.isoformat(), "$lte": end.isoformat()}}
+
         m = re.search(
             r'(?:from|is|date is|date)\s+([a-z]{3,9})\s+(\d{4})\s+(?:to|till|until)\s+now',
             query_lower
@@ -1862,12 +1941,142 @@ class ChatOrchestrator:
             return "createdAt"
         if coll == "invoices" and "overdue" in query_lower:
             return "due_date"
+        if coll == "invoices":
+            return "invoice_date"
         if coll == "createtasks" and "overdue" in query_lower:
             return "due_date"
         if coll == "meetings":
             return "start"
 
         return "createdAt"
+
+    def _apply_enriched_intent_constraints(
+        self,
+        plan: Dict[str, Any],
+        enriched_intent: Dict[str, Any],
+        resolved_query: str,
+    ) -> Dict[str, Any]:
+        """
+        Enforce temporal and paid-status constraints extracted by understanding layers.
+        This keeps follow-up requests aligned with prior year/revenue context.
+        """
+        out = dict(plan or {})
+        if not out:
+            return out
+
+        collection = str(out.get("collection", "")).lower()
+        query_lower = (resolved_query or "").lower()
+
+        temporal = enriched_intent.get("temporal_filter") or {}
+        if isinstance(temporal, dict) and temporal.get("type") not in (None, "none"):
+            start_date = temporal.get("start_date")
+            end_date = temporal.get("end_date")
+            if start_date or end_date:
+                date_field = self._infer_date_field(query_lower, collection)
+                range_filter: Dict[str, Any] = {}
+                if start_date:
+                    range_filter["$gte"] = start_date
+                if end_date:
+                    range_filter["$lte"] = end_date
+                if range_filter:
+                    out = self._merge_date_filter(out, {date_field: range_filter})
+
+        require_paid = False
+        if collection == "invoices":
+            primary_intent = str(enriched_intent.get("primary_intent", "")).lower()
+            if "payment_status paid" in query_lower:
+                require_paid = True
+            if "revenue" in query_lower:
+                require_paid = True
+            if primary_intent.startswith("revenue"):
+                require_paid = True
+
+        if require_paid:
+            if out.get("type") in ("find", "count"):
+                filt = out.get("filter") if isinstance(out.get("filter"), dict) else {}
+                filt["payment_status"] = "paid"
+                out["filter"] = filt
+            elif out.get("type") == "aggregate":
+                pipeline = out.get("pipeline") if isinstance(out.get("pipeline"), list) else []
+                if (
+                    pipeline
+                    and isinstance(pipeline[0], dict)
+                    and "$match" in pipeline[0]
+                    and isinstance(pipeline[0]["$match"], dict)
+                ):
+                    pipeline[0]["$match"]["payment_status"] = "paid"
+                else:
+                    pipeline = [{"$match": {"payment_status": "paid"}}] + pipeline
+                out["pipeline"] = pipeline
+
+        return out
+
+    def _post_filter_results_by_intent(
+        self,
+        data: Any,
+        plan: Dict[str, Any],
+        enriched_intent: Dict[str, Any],
+        resolved_query: str,
+    ) -> Any:
+        """Safety net when planner/executor misses temporal or paid constraints."""
+        if not isinstance(data, list) or not data:
+            return data
+
+        collection = str((plan or {}).get("collection", "")).lower()
+        if collection != "invoices":
+            return data
+
+        query_lower = (resolved_query or "").lower()
+        require_paid = ("payment_status paid" in query_lower) or ("revenue" in query_lower)
+        temporal = enriched_intent.get("temporal_filter") or {}
+        start_date = temporal.get("start_date") if isinstance(temporal, dict) else None
+        end_date = temporal.get("end_date") if isinstance(temporal, dict) else None
+        if not (start_date and end_date):
+            y_match = re.search(r"\b(20\d{2})\b", query_lower)
+            if y_match:
+                y = int(y_match.group(1))
+                start_date = datetime(y, 1, 1).isoformat()
+                end_date = (
+                    datetime.now().isoformat()
+                    if y == datetime.now().year
+                    else datetime(y, 12, 31, 23, 59, 59).isoformat()
+                )
+
+        def _to_dt(v: Any) -> Optional[datetime]:
+            if isinstance(v, datetime):
+                return v
+            if not isinstance(v, str):
+                return None
+            vv = v.strip().replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(vv)
+            except Exception:
+                pass
+            try:
+                return datetime.fromisoformat(vv[:19])
+            except Exception:
+                return None
+
+        start_dt = _to_dt(start_date) if start_date else None
+        end_dt = _to_dt(end_date) if end_date else None
+
+        filtered = []
+        for row in data:
+            if not isinstance(row, dict):
+                filtered.append(row)
+                continue
+            if require_paid and str(row.get("payment_status", "")).lower() != "paid":
+                continue
+            if start_dt or end_dt:
+                dt = _to_dt(row.get("invoice_date") or row.get("createdAt"))
+                if dt is None:
+                    continue
+                if start_dt and dt < start_dt:
+                    continue
+                if end_dt and dt > end_dt:
+                    continue
+            filtered.append(row)
+        return filtered
 
     def _merge_date_filter(self, plan: Dict[str, Any], date_filter: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(plan)
@@ -1876,6 +2085,8 @@ class ChatOrchestrator:
             for k, v in date_filter.items():
                 if k not in filt:
                     filt[k] = v
+                elif isinstance(filt.get(k), dict) and isinstance(v, dict):
+                    filt[k].update(v)
             out["filter"] = filt
         elif out.get("type") == "aggregate":
             pipeline = out.get("pipeline") if isinstance(out.get("pipeline"), list) else []
@@ -1883,14 +2094,20 @@ class ChatOrchestrator:
                     and "$match" in pipeline[0]
                     and isinstance(pipeline[0]["$match"], dict)):
                 for k, v in date_filter.items():
-                    pipeline[0]["$match"].setdefault(k, v)
+                    if k not in pipeline[0]["$match"]:
+                        pipeline[0]["$match"][k] = v
+                    elif isinstance(pipeline[0]["$match"].get(k), dict) and isinstance(v, dict):
+                        pipeline[0]["$match"][k].update(v)
             else:
                 pipeline = [{"$match": dict(date_filter)}] + pipeline
             out["pipeline"] = pipeline
         elif out.get("type") == "count":
             filt = out.get("filter") if isinstance(out.get("filter"), dict) else {}
             for k, v in date_filter.items():
-                filt.setdefault(k, v)
+                if k not in filt:
+                    filt[k] = v
+                elif isinstance(filt.get(k), dict) and isinstance(v, dict):
+                    filt[k].update(v)
             out["filter"] = filt
         return out
 
@@ -2414,11 +2631,13 @@ class ChatOrchestrator:
         return result
 
     def _is_cacheable_response(self, response: str) -> bool:
-        """Avoid caching low-signal placeholder responses."""
+        """Avoid caching low-signal placeholder responses or error responses."""
         txt = (response or "").strip()
         if not txt:
             return False
-        if "No results found" in txt or "I could not find any results" in txt:
+        # FIX 6A: never cache error/not-found responses
+        txt_lower = txt.lower()
+        if any(p in txt_lower for p in _DONT_CACHE_PATTERNS):
             return False
         # Placeholder-heavy lists are usually weak semantic matches.
         if len(re.findall(r"^\d+\.\s+Record\b", txt, flags=re.MULTILINE)) >= 3:
@@ -2647,9 +2866,11 @@ class ChatOrchestrator:
         if "this company" not in q:
             return None
 
-        # Extract company name from qparams (already extracted by query understander)
+        # Extract company name from qparams — clean prefix noise (FIX 1)
         company_name = (qparams.entity_names[0]
                         if qparams.entity_names else None)
+        if company_name:
+            company_name = _clean_entity_name(company_name)
         if not company_name:
             return None
 

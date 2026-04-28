@@ -46,15 +46,26 @@ else
 fi
 
 echo
-echo "Starting Streamlit app on http://localhost:8501"
+echo "Starting Elsner ECRM Chatbot (React UI + Flask backend)"
+echo "  Chat UI  →  http://localhost:8000"
+echo "  API base →  http://localhost:8000"
 echo "Press Ctrl+C to stop."
 echo
 
-# Reduce noisy transformer lazy-import warnings triggered by Streamlit file watching.
+# ── Clear port 8000 if anything is already running on it ──
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k 8000/tcp 2>/dev/null && echo "[run.sh] Cleared existing process on port 8000." || true
+  sleep 0.5
+fi
+
+# Reduce noisy transformer lazy-import warnings.
 export TRANSFORMERS_VERBOSITY=error
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 
-exec streamlit run app.py \
-  --server.headless true \
-  --server.port 8501 \
-  --server.fileWatcherType none
+# Force Python to flush stdout immediately (so logs appear in real-time)
+export PYTHONUNBUFFERED=1
+
+# ── Flask server serves React UI + all API endpoints ──
+# Streamlit (app.py) is kept but disabled — to re-enable:
+#   exec streamlit run app.py --server.headless true --server.port 8501
+exec "${VENV_DIR}/bin/python" -u server.py

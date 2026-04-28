@@ -541,6 +541,12 @@ def _resolve_temporal_dates(
 
     if type_ == "specific_year":
         y = int(year) if year is not None else now.year
+        if y == now.year:
+            start = datetime(y, 1, 1)
+            return {
+                "start_date": iso(start),
+                "end_date": iso(now),
+            }
         return {
             "start_date": iso(datetime(y, 1, 1)),
             "end_date": iso(datetime(y, 12, 31, 23, 59, 59)),

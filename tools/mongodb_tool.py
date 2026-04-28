@@ -76,7 +76,8 @@ def execute_find(collection: str, filter_dict: dict,
             cursor = cursor.sort(sort)
         if skip:
             cursor = cursor.skip(skip)
-        cursor = cursor.limit(limit or MAX_MONGO_RESULTS)
+        if isinstance(limit, int) and limit > 0:
+            cursor = cursor.limit(limit)
 
         results = []
         for doc in cursor:
@@ -103,11 +104,6 @@ def execute_aggregate(collection: str, pipeline: list) -> List[Dict]:
         pipeline = _sanitize_pipeline(pipeline)
         # Ensure soft-delete filters are always applied when configured
         pipeline = _inject_soft_delete_match(collection, pipeline)
-
-        # Add result limit at the end if not already present
-        has_limit = any("$limit" in stage for stage in pipeline)
-        if not has_limit:
-            pipeline.append({"$limit": MAX_MONGO_RESULTS})
 
         cursor = db[collection].aggregate(
             pipeline, allowDiskUse=True, maxTimeMS=MAX_MONGO_TIME_MS

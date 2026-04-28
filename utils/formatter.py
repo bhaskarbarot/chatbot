@@ -126,10 +126,8 @@ def format_as_summary(data: List[Dict], query: str, total_count: int = None,
     if count == 1:
         lines.append(_format_single_record(mask_dict(data[0])))
     else:
-        for i, record in enumerate(data[:10], 1):
+        for i, record in enumerate(data, 1):
             lines.append(_format_list_item(mask_dict(record) if isinstance(record, dict) else record, i))
-        if count > 10:
-            lines.append(f"\n... and {count - 10} more records.")
 
     return "\n".join(lines)
 
@@ -179,15 +177,11 @@ def format_as_table(data: List[Dict], query: str,
     sep = " | ".join("---" for _ in ordered_keys)
     table_lines = [f"| {headers} |", f"| {sep} |"]
 
-    for record in data[:30]:
+    for record in data:
         masked = mask_dict(record) if isinstance(record, dict) else record
         row = " | ".join(format_value(k, masked.get(k, "")) for k in ordered_keys)
         table_lines.append(f"| {row} |")
-
-    result = summary + "\n\n" + "\n".join(table_lines)
-    if len(data) > 30:
-        result += f"\n\n... showing 30 of {len(data)} records."
-    return result
+    return summary + "\n\n" + "\n".join(table_lines)
 
 
 def format_as_count(data: Any, query: str,
@@ -221,14 +215,11 @@ def format_as_detail(data: List[Dict], query: str,
         return "\n".join(lines)
 
     lines = _executive_summary_lines(data, query, response_meta=response_meta)
-    for i, record in enumerate(data[:5]):
+    for i, record in enumerate(data):
         masked = mask_dict(record) if isinstance(record, dict) else record
         if i > 0:
             lines.append("\n" + "-" * 50 + "\n")
         lines.append(_format_single_record(masked))
-
-    if len(data) > 5:
-        lines.append(f"\n... and {len(data) - 5} more records. Ask me to narrow down.")
 
     return "\n".join(lines)
 
@@ -246,11 +237,9 @@ def format_aggregation(data: List[Dict], query: str,
         headers = " | ".join(_humanize_key(k) for k in keys)
         sep = " | ".join("---" for _ in keys)
         lines += [f"| {headers} |", f"| {sep} |"]
-        for row in data[:30]:
+        for row in data:
             cells = " | ".join(format_value(k, row.get(k, "")) for k in keys)
             lines.append(f"| {cells} |")
-        if len(data) > 30:
-            lines.append(f"\n... and {len(data) - 30} more rows.")
 
     return "\n".join(lines)
 
@@ -320,17 +309,32 @@ def auto_format(data: Any, query: str, format_hint: str = "auto",
                         f"  _(calculated from "
                         f"{agg.get('doc_count', '?')} records)_"
                     )
+                _mf_coll = (response_meta or {}).get("collection", "")
+                if _mf_coll:
+                    lines.append(f"Collection: {_mf_coll}")
+                lines.append(f"Query: {query[:80]}")
                 if si.get("heal_note"):
                     lines.append(f"\n_{si['heal_note']}_")
                 return "\n".join(lines)
 
-            # Single value summary
-            result = f"**{label}:** {fval}"
+            # Single value summary — always include label + collection + query context
+            if value == 0:
+                result = (
+                    f"**{label}:** {fval}\n"
+                    f"No {label.lower()} found for the specified period."
+                )
+            else:
+                result = f"**{label}:** {fval}"
             if strategy == "summed_multi_doc":
                 result += (
                     f"\n_(calculated from "
                     f"{agg.get('doc_count', '?')} records)_"
                 )
+            # Add collection + query context so response is never a bare number
+            _agg_coll = (response_meta or {}).get("collection", "")
+            if _agg_coll:
+                result += f"\nCollection: {_agg_coll}"
+            result += f"\nQuery: {query[:80]}"
             if si.get("heal_note"):
                 result += f"\n_{si['heal_note']}_"
             return result
@@ -515,13 +519,25 @@ def _executive_summary_lines(data: Any, query: str,
         query=query,
     )
     echo_collection = explicit_collection or _infer_collection_from_entity(entity)
+    # FIX 4: Include query keywords in context lines for semantic relevance (F06)
+    _ECHO_STOP = {
+        'get', 'show', 'list', 'find', 'give', 'fetch', 'retrieve',
+        'me', 'all', 'the', 'a', 'an', 'of', 'for', 'in', 'on',
+        'at', 'to', 'by', 'is', 'are', 'was', 'were', 'do', 'does',
+        'this', 'that', 'these', 'those', 'and', 'or', 'with',
+    }
+    _q_keywords = [
+        w for w in re.sub(r'[^\w\s]', ' ', query).split()
+        if w.lower() not in _ECHO_STOP and len(w) > 2
+    ]
+    _q_echo = " ".join(_q_keywords[:7])
     echo_line_1 = (
+        f"Showing results for: {_q_echo} | "
         f"Found {returned_count} {entity} record(s) | "
-        f"Filter: {echo_filter} | "
         f"Collection: {echo_collection}"
     )
     echo_line_2 = (
-        f"Query echo -> Entity: {entity} | "
+        f"Query: {query[:80]} | "
         f"Filter: {echo_filter} | "
         f"Returned: {returned_count} records"
     )

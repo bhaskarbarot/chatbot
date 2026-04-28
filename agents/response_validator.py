@@ -141,10 +141,6 @@ class ResponseValidator:
                 shape_applied = "single"
 
         elif response_shape == "list":
-            # Cap at MAX_MONGO_RESULTS from config
-            if isinstance(data, list) and len(data) > MAX_MONGO_RESULTS:
-                data = data[:MAX_MONGO_RESULTS]
-                logger.debug(f"[Validator] capped list at MAX_MONGO_RESULTS={MAX_MONGO_RESULTS}")
             shape_applied = "list"
 
         elif response_shape == "table":

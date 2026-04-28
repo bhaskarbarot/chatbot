@@ -265,6 +265,17 @@ class ChatMemory:
         if is_followup and self.get_last_collection():
             # Ensure unresolved follow-ups carry immediate prior module context.
             collection = self.get_last_collection()
+            if re.search(r"\b(this|that|these|those)\s+invoices?\b", q_lower):
+                last_user_query = (self.short_term[-1].get("user", "") if self.short_term else "")
+                year_match = re.search(r"\b(20\d{2})\b", last_user_query)
+                if year_match:
+                    resolved = (
+                        f"{query} for {year_match.group(1)} "
+                        f"with payment_status paid"
+                    )
+                else:
+                    resolved = f"{query} with same filters as previous query"
+                return resolved, True
             q_words = set(re.findall(r"\w+", q_lower))
             needs_context = not bool(q_words & {
                 "deal", "deals", "invoice", "invoices", "company", "companies",

@@ -301,6 +301,11 @@ def _apply_temporal_filter(filter_doc: Dict, field: str, query_lower: str) -> No
         year = now.year if now.month >= 4 else now.year - 1
         start = datetime(year, 4, 1)
         filter_doc[field] = {"$gte": start.isoformat(), "$lte": now.isoformat()}
+    elif re.search(r"\b(20\d{2})\b", query_lower):
+        year = int(re.search(r"\b(20\d{2})\b", query_lower).group(1))
+        start = datetime(year, 1, 1)
+        end = now if year == now.year else datetime(year, 12, 31, 23, 59, 59)
+        filter_doc[field] = {"$gte": start.isoformat(), "$lte": end.isoformat()}
     else:
         m = re.search(r"last\s+(\d+)\s+(day|week|month|year)s?", query_lower)
         if m:

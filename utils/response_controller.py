@@ -137,7 +137,21 @@ class ResponseController:
             corrected = self._enforce_yes_no(response)
 
         elif response_shape in ("number", "count"):
-            corrected = self._extract_number_from_response(response)
+            # FIX 2/5: Only correct if response is truly just a bare number with no label.
+            # If the formatter already produced a labeled contextual response
+            # (e.g. "**Total:** 80,816.79\nCollection: invoices\nQuery: ..."),
+            # leave it unchanged — stripping it to the bare number is wrong.
+            stripped_r = response.strip()
+            _already_labeled = (
+                "**" in stripped_r
+                or "Collection:" in stripped_r
+                or "Query:" in stripped_r
+                or "Total count:" in stripped_r
+                or re.match(r'^\d[\d,\.]+\s*$', stripped_r) is None
+            )
+            if not _already_labeled:
+                corrected = self._extract_number_from_response(response)
+            # else: keep response unchanged — it already has context
 
         elif response_shape == "single_value":
             corrected = self._enforce_single(response)
