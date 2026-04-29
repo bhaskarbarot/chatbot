@@ -21,9 +21,13 @@ Thread-safe: stateless — no shared mutable state per call.
 from __future__ import annotations
 
 import copy
+import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from utils.logger import get_logger
 from utils.metrics import record_event

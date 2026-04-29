@@ -77,6 +77,7 @@ def execute_find(collection: str, filter_dict: dict,
     db = get_db()
     try:
         filter_dict = _normalize_query_literals(filter_dict)
+        filter_dict = _sanitize_filter(filter_dict)
         # Auto-add soft delete filter
         filter_dict = _add_soft_delete(collection, filter_dict)
 
@@ -152,6 +153,7 @@ def execute_count(collection: str, filter_dict: dict) -> int:
     db = get_db()
     try:
         filter_dict = _normalize_query_literals(filter_dict)
+        filter_dict = _sanitize_filter(filter_dict)
         filter_dict = _add_soft_delete(collection, filter_dict)
         count = _mongo_call(
             lambda: db[collection].count_documents(filter_dict, maxTimeMS=MAX_MONGO_TIME_MS),
@@ -176,6 +178,7 @@ def execute_distinct(collection: str, field: str,
     db = get_db()
     try:
         filter_dict = _normalize_query_literals(filter_dict or {})
+        filter_dict = _sanitize_filter(filter_dict)
         filter_dict = _add_soft_delete(collection, filter_dict or {})
         results = _mongo_call(
             lambda: db[collection].distinct(field, filter_dict, maxTimeMS=MAX_MONGO_TIME_MS),
@@ -265,6 +268,44 @@ def _fix_date_regex(obj: Any) -> Any:
     return obj
 
 
+def _sanitize_filter(filter_dict: dict) -> dict:
+    """
+    Fix common LLM-generated query mistakes before sending to MongoDB.
+    Handles nested operator errors and invalid query patterns.
+    """
+    if not isinstance(filter_dict, dict):
+        return filter_dict
+
+    sanitized = {}
+    for key, value in filter_dict.items():
+        # Top-level $options is invalid — remove it
+        if key == "$options":
+            continue
+
+        # Pattern: {"$in": {"$regex": "x", "$options": "i"}}
+        if key == "$in" and isinstance(value, dict) and "$regex" in value:
+            return value
+
+        # $in with non-list value — wrap in list
+        if key == "$in" and not isinstance(value, list):
+            if value is not None:
+                sanitized[key] = [value]
+            continue
+
+        # Recursively sanitize nested dicts/lists
+        if isinstance(value, dict):
+            sanitized[key] = _sanitize_filter(value)
+        elif isinstance(value, list):
+            sanitized[key] = [
+                _sanitize_filter(v) if isinstance(v, dict) else v
+                for v in value
+            ]
+        else:
+            sanitized[key] = value
+
+    return sanitized
+
+
 def _sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize malformed planner outputs into executable shape."""
     out = dict(plan)
@@ -285,7 +326,7 @@ def _sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
                         filt.pop("$limit", None)
                 else:
                     filt.pop(bad_key, None)
-        out["filter"] = _fix_date_regex(filt)
+        out["filter"] = _sanitize_filter(_fix_date_regex(filt))
         if "sort" in out:
             out["sort"] = _normalize_sort_spec(out.get("sort"))
     elif qtype == "aggregate" and isinstance(out.get("pipeline"), list):
@@ -297,13 +338,13 @@ def _sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
             if op == "$sort":
                 fixed_pipeline.append({"$sort": _normalize_sort_object(payload)})
             elif op == "$match":
-                fixed_pipeline.append({"$match": _fix_date_regex(payload)})
+                fixed_pipeline.append({"$match": _sanitize_filter(_fix_date_regex(payload))})
             else:
                 fixed_pipeline.append({op: payload})
         out["pipeline"] = fixed_pipeline
     elif qtype == "count":
         filt = out.get("filter") or {}
-        out["filter"] = _fix_date_regex(filt)
+        out["filter"] = _sanitize_filter(_fix_date_regex(filt))
     return out
 
 
@@ -635,6 +676,10 @@ def _sanitize_pipeline(pipeline: list) -> list:
             sanitized.append({op: _sanitize_expression_tree(payload)})
         elif op == "$group":
             sanitized.append({op: _sanitize_group_stage(payload)})
+        elif op == "$match":
+            cleaned_match = _sanitize_expression_tree(payload)
+            cleaned_match = _sanitize_filter(cleaned_match if isinstance(cleaned_match, dict) else {})
+            sanitized.append({op: cleaned_match})
         else:
             sanitized.append({op: _sanitize_expression_tree(payload)})
     return sanitized

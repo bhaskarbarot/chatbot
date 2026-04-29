@@ -17,12 +17,17 @@ Thread safety: no shared mutable state per query — each call is independent.
 from __future__ import annotations
 
 import calendar
+import concurrent.futures
 import copy
 import json
+import os
 import re
+import sys
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from config import MAX_MONGO_RESULTS, OLLAMA_BASE_URL, OLLAMA_MODEL
 from utils.logger import get_logger
@@ -31,7 +36,7 @@ from utils.metrics import record_event
 logger = get_logger("deep_query_understander")
 
 # ── Layer-specific LLM settings (fail fast, not the planner's 20s) ──────────
-_LLM_TIMEOUT_S = 3
+_LLM_TIMEOUT_S = 5
 _LLM_MAX_TOKENS = 350
 _LLM_TEMPERATURE = 0
 
@@ -154,12 +159,22 @@ class DeepQueryUnderstander:
 
         record_event("deep_understander_called", {"query": query[:80]})
 
-        # Attempt LLM path
-        result = self._safe_llm_call(query)
-        if result is None:
-            # Full rule-based fallback
-            result = _rule_based_understand(query)
-            record_event("deep_understander_fallback_used", {})
+        # Attempt LLM path with strict wall-clock budget while computing fallback in parallel.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        llm_future = executor.submit(self._safe_llm_call, query)
+        fallback_future = executor.submit(_rule_based_understand, query)
+        try:
+            result = llm_future.result(timeout=5.0)
+            if result is None:
+                result = fallback_future.result()
+                record_event("deep_understander_fallback_used", {})
+        except concurrent.futures.TimeoutError:
+            logger.warning("[DeepUnderstander] LLM blocked >5s — switching to rule-based fallback")
+            result = fallback_future.result()
+            record_event("deep_understander_fallback_used", {"reason": "llm_timeout"})
+            llm_future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         # Resolve temporal date ranges from type+value+year+month
         tf = result.get("temporal_filter", {})

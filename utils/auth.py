@@ -8,7 +8,7 @@ Configuration (add to .env):
   SESSION_TIMEOUT_S=28800
 
 To generate a password hash:
-  python3 -c "import hashlib; print(hashlib.sha256(b'yourpassword').hexdigest())"
+  python3 -c "import hashlib,sys; sys.stdout.write(hashlib.sha256(b'yourpassword').hexdigest())"
 
 Usage in app.py:
   from utils.auth import require_auth
@@ -65,7 +65,7 @@ def _show_login() -> bool:
             if not AUTH_PASSWORD_HASH:
                 st.error(
                     "AUTH_PASSWORD_HASH is not set in .env. "
-                    "Run: python3 -c \"import hashlib; print(hashlib.sha256(b'yourpw').hexdigest())\""
+                    "Run: python3 -c \"import hashlib,sys; sys.stdout.write(hashlib.sha256(b'yourpw').hexdigest())\""
                 )
                 return False
             if username == AUTH_USERNAME and _hash(password) == AUTH_PASSWORD_HASH:

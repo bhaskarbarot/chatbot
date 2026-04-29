@@ -4,10 +4,13 @@ Takes a user query + matched rules + chat context and generates
 a structured MongoDB query plan using the local Ollama model.
 """
 import json
+import os
 import re
-import ast
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from config import (
     OLLAMA_BASE_URL, OLLAMA_MODEL, COLLECTION_NAMES,
@@ -160,10 +163,11 @@ def _generate_and_validate_plan_safe(
         logger.debug(f"LLM raw output: {raw_text[:500]}")
 
         # Content validation — failures here silently return None (no exception).
-        plan = _extract_json(raw_text)
+        plan = _extract_json_robust(raw_text)
         if not isinstance(plan, dict):
             error_holder[0] = "Could not extract a JSON object from model output."
             return
+        plan = _fix_regex_operators(plan)
         plan = _postprocess_plan(plan, user_query)
         err = _validate_plan_schema(plan)
         if err:
@@ -294,59 +298,91 @@ def plan_query_from_rule(user_query: str, rule: Dict,
     return plan
 
 
-def _extract_json(text: str) -> Optional[Dict]:
-    """Extract JSON from LLM response text."""
-    def _try_parse(candidate: str) -> Optional[Dict]:
-        try:
-            parsed = json.loads(candidate)
-            return parsed if isinstance(parsed, dict) else None
-        except Exception:
-            pass
-        try:
-            parsed = ast.literal_eval(candidate)
-            if isinstance(parsed, dict):
-                # normalize through json for consistent types
-                return json.loads(json.dumps(parsed, default=str))
-        except Exception:
-            pass
-        return None
+def _extract_json_robust(text: str) -> Dict:
+    """
+    Extract JSON from LLM output regardless of wrapping.
+    Handles: raw JSON, markdown code blocks, explanation+JSON,
+    JSON with trailing text, partial JSON repair.
+    """
+    if not text or not text.strip():
+        return {}
 
-    # Try direct parse
-    direct = _try_parse(text)
-    if direct is not None:
-        return direct
+    # Strategy 1: Try direct parse first
+    try:
+        parsed = json.loads(text.strip())
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
 
-    # Try to find JSON block in markdown
-    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if json_match:
-        parsed = _try_parse(json_match.group(1))
-        if parsed is not None:
-            return parsed
+    # Strategy 2: Extract from markdown code block
+    for pattern in [
+        r"```json\s*([\s\S]*?)\s*```",
+        r"```\s*([\s\S]*?)\s*```",
+        r"`({[\s\S]*?})`",
+    ]:
+        m = re.search(pattern, text, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(1).strip())
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                pass
 
-    # Strict brace-balance extraction (full object only)
+    # Strategy 3: Find first balanced { ... } block
     start = text.find("{")
     if start >= 0:
         depth = 0
-        for idx in range(start, len(text)):
-            ch = text[idx]
-            if ch == "{":
+        for i, c in enumerate(text[start:], start):
+            if c == "{":
                 depth += 1
-            elif ch == "}":
+            elif c == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = text[start:idx + 1]
-                    parsed = _try_parse(candidate)
-                    if parsed is not None:
-                        return parsed
-                    else:
-                        break
+                    chunk = text[start:i + 1]
+                    try:
+                        parsed = json.loads(chunk)
+                        return parsed if isinstance(parsed, dict) else {}
+                    except Exception:
+                        # Try simple repair: remove trailing commas
+                        chunk = re.sub(r",\s*}", "}", chunk)
+                        chunk = re.sub(r",\s*]", "]", chunk)
+                        try:
+                            parsed = json.loads(chunk)
+                            return parsed if isinstance(parsed, dict) else {}
+                        except Exception:
+                            break
 
-    return None
+    return {}
+
+
+def _extract_json(text: str) -> Optional[Dict]:
+    """Backward-compatible alias."""
+    parsed = _extract_json_robust(text)
+    return parsed if isinstance(parsed, dict) and parsed else None
+
+
+def _fix_regex_operators(plan: dict) -> dict:
+    """
+    Fix LLM-generated regex patterns before plan execution.
+    Converts invalid nested regex to proper MongoDB regex syntax.
+    """
+    plan_str = json.dumps(plan)
+    plan_str = re.sub(
+        r'"\$in"\s*:\s*(\{[^}]*"\$regex"[^}]*\})',
+        lambda m: m.group(1),
+        plan_str,
+    )
+    try:
+        loaded = json.loads(plan_str)
+        return loaded if isinstance(loaded, dict) else plan
+    except Exception:
+        return plan
 
 
 def _postprocess_plan(plan: Dict, user_query: str) -> Dict:
     """Validate and fix common issues in generated query plans."""
     plan = _normalize_extended_json(plan)
+    plan = _ensure_plan_type(plan)
 
     # Ensure dates are proper
     plan = _fix_dates(plan)
@@ -379,6 +415,32 @@ def _postprocess_plan(plan: Dict, user_query: str) -> Dict:
     plan = _enforce_exact_entity_lookup(plan, user_query)
 
     return plan
+
+
+def _ensure_plan_type(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Infer a valid plan type when model output omits/invalidates it."""
+    out = dict(plan or {})
+    plan_type = out.get("type")
+    if plan_type in VALID_PLAN_TYPES:
+        return out
+
+    if isinstance(out.get("steps"), list) and out.get("steps"):
+        out["type"] = "multi_step"
+        return out
+    if isinstance(out.get("pipeline"), list) and out.get("pipeline"):
+        out["type"] = "aggregate"
+        return out
+    if isinstance(out.get("field"), str) and out.get("field").strip():
+        out["type"] = "distinct"
+        return out
+    hint = str(out.get("response_hint", "")).lower()
+    if hint == "count":
+        out["type"] = "count"
+        return out
+
+    # Safe default for plain collection/filter plans.
+    out["type"] = "find"
+    return out
 
 
 def _enforce_exact_entity_lookup(plan: Dict[str, Any], user_query: str) -> Dict[str, Any]:
@@ -887,3 +949,6 @@ class QueryPlanner:
             sort_hint=sort_hint,
             limit_override=limit_override,
         )
+
+    def _extract_json_robust(self, text: str) -> dict:
+        return _extract_json_robust(text)
