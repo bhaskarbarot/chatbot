@@ -26,7 +26,7 @@ logger = get_logger("cache")
 _RESP_PREFIX = "chat:resp:"
 _EMBD_PREFIX = "chat:embd:"
 _INDEX_KEY = "chat:qidx"
-_CACHE_SCHEMA_VERSION = "v2"
+_CACHE_SCHEMA_VERSION = "v4"
 MAX_INDEX_SIZE = 500
 
 
@@ -210,10 +210,13 @@ class ResponseCache:
         try:
             pipe = self._redis.pipeline(transaction=False)
             for cq in index:
+                if not str(cq).startswith(f"{_CACHE_SCHEMA_VERSION}:"):
+                    continue
                 pipe.get(f"{_EMBD_PREFIX}{cq}")
             raw_vecs = pipe.execute()
 
-            for cq, raw in zip(index, raw_vecs):
+            versioned_queries = [cq for cq in index if str(cq).startswith(f"{_CACHE_SCHEMA_VERSION}:")]
+            for cq, raw in zip(versioned_queries, raw_vecs):
                 if raw is None:
                     continue
                 vec = np.frombuffer(raw, dtype=np.float32)

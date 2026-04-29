@@ -729,7 +729,28 @@ def _build_filter_from_process(process: str, params: Dict,
         filter_dict.setdefault(chosen_field, {"$regex": str(first_param), "$options": "i"})
 
     # Apply direct user-intent cues from query text.
+    # IMPORTANT: relative temporal windows must be computed from "now" at runtime
+    # so they never become stale from cached/rule-template periods.
     q = (query_text or "").lower()
+    m_last_days = re.search(r"\blast\s+(\d+)\s+days?\b", q)
+    m_last_weeks = re.search(r"\blast\s+(\d+)\s+weeks?\b", q)
+    m_last_months = re.search(r"\blast\s+(\d+)\s+months?\b", q)
+    if m_last_days or m_last_weeks or m_last_months:
+        now_dt = datetime.now()
+        if m_last_days:
+            n_days = max(1, int(m_last_days.group(1)))
+            start_dt = now_dt - timedelta(days=n_days)
+        elif m_last_weeks:
+            n_weeks = max(1, int(m_last_weeks.group(1)))
+            start_dt = now_dt - timedelta(days=n_weeks * 7)
+        else:
+            n_months = max(1, int(m_last_months.group(1)))
+            start_dt = now_dt - timedelta(days=n_months * 30)
+        filter_dict["createdAt"] = {
+            "$gte": start_dt.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(),
+            "$lte": now_dt.isoformat(),
+        }
+
     if collection == "deals":
         if "closed won" in q or "won deals" in q:
             filter_dict.setdefault("dealWonAt", {"$ne": None})

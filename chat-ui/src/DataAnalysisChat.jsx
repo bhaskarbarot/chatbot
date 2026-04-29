@@ -22,7 +22,9 @@ function qhTrack(query) {
     const filtered = recent.filter(r => r.toLowerCase() !== q.toLowerCase());
     filtered.unshift(q);
     localStorage.setItem(QH_RECENT_KEY, JSON.stringify(filtered.slice(0, 20)));
-  } catch (_) {}
+  } catch (error) {
+    void error;
+  }
 }
 
 function qhGetSuggestions() {
@@ -37,7 +39,8 @@ function qhGetSuggestions() {
       .filter(q => !recentTop3.some(r => r.toLowerCase() === q.toLowerCase()))
       .slice(0, 4);
     return { recent: recentTop3, top: topByFreq };
-  } catch (_) {
+  } catch (error) {
+    void error;
     return { recent: [], top: [] };
   }
 }
@@ -122,7 +125,7 @@ function inlineMarkdown(str) {
     .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
     .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" class="md-link">$1</a>');
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener" class="md-link">$1</a>');
 }
 
 function parseTableBlock(lines) {
@@ -446,7 +449,7 @@ function TimingBadge({ ms }) {
   return <Badge color={color}>⏱ {label}</Badge>;
 }
 
-function MessageBubble({ msg, apiUrl }) {
+function MessageBubble({ msg }) {
   const isUser = msg.role === "user";
   // Detect if the answer text already contains a rendered table (|...|) to avoid double render
   const answerHasTable = !isUser && typeof msg.content === "string" && /\|.+\|/.test(msg.content);
@@ -910,7 +913,7 @@ export default function DataAnalysisChat() {
 
   function stopWakeWord() {
     if (wakeWordRef.current) {
-      try { wakeWordRef.current.abort(); } catch {}
+      try { wakeWordRef.current.abort(); } catch (error) { void error; }
       wakeWordRef.current = null;
     }
   }
@@ -926,7 +929,7 @@ export default function DataAnalysisChat() {
         const t = ev.results[i][0].transcript.toLowerCase();
         if (t.includes('hi elsner') || t.includes('hey elsner')) {
           stopWakeWord();
-          startListening(); // eslint-disable-line no-use-before-define
+          startListening();
           return;
         }
       }
@@ -942,7 +945,7 @@ export default function DataAnalysisChat() {
       // For other errors (network, aborted) retry after a short wait
       if (!recognitionRef.current) setTimeout(startWakeWord, 1000);
     };
-    try { ww.start(); wakeWordRef.current = ww; } catch {}
+    try { ww.start(); wakeWordRef.current = ww; } catch (error) { void error; }
   }
 
   function startListening() {
@@ -952,7 +955,7 @@ export default function DataAnalysisChat() {
     }
     stopWakeWord();
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
+      try { recognitionRef.current.stop(); } catch (error) { void error; }
       recognitionRef.current = null;
     }
     transcriptBuf.current = '';
@@ -974,7 +977,9 @@ export default function DataAnalysisChat() {
       setInput((transcriptBuf.current + interim).trim());
       clearTimeout(silenceRef.current);
       silenceRef.current = setTimeout(() => {
-        if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
+        if (recognitionRef.current) {
+          try { recognitionRef.current.stop(); } catch (error) { void error; }
+        }
       }, 1800);
     };
 
@@ -1009,7 +1014,7 @@ export default function DataAnalysisChat() {
   function stopListening() {
     clearTimeout(silenceRef.current);
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
+      try { recognitionRef.current.stop(); } catch (error) { void error; }
       recognitionRef.current = null;
     }
     setVoiceStatus('idle');
@@ -1126,7 +1131,7 @@ export default function DataAnalysisChat() {
   };
 
   const clearCache = async () => {
-    try { await apiPost(apiUrl, "/cache/clear", {}, null); } catch { /* ignore */ }
+    try { await apiPost(apiUrl, "/cache/clear", {}, null); } catch (error) { void error; }
   };
 
   // ── Voice: reset 'processing' status when API call finishes ──
@@ -1164,7 +1169,9 @@ export default function DataAnalysisChat() {
     return () => {
       if (permStatus) permStatus.onchange = null;
       stopWakeWord();
-      if (recognitionRef.current) try { recognitionRef.current.stop(); } catch {}
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch (error) { void error; }
+      }
       clearTimeout(silenceRef.current);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps

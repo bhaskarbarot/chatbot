@@ -211,9 +211,8 @@ def format_as_count(data: Any, query: str,
     else:
         count = data
 
-    lines = _executive_summary_lines(count, query, response_meta=response_meta)
-    lines.append(f"Total Count: **{count}**")
-    return "\n".join(lines)
+    collection = (response_meta or {}).get("collection", "")
+    return _wrap_number_response(count, query, collection)
 
 
 def format_as_detail(data: List[Dict], query: str,
@@ -278,9 +277,11 @@ def _wrap_number_response(value, query: str, collection: str = "") -> str:
                 formatted = f"{fval:.1f}%"
         except Exception:
             pass
+    _coll_display = collection or "N/A"
+    _entity_suffix = f" {_coll_display}" if collection and collection not in ("N/A", "") else ""
     response_lines = [
-        f"{label}: **{formatted}**",
-        f"Collection: {collection or 'N/A'}",
+        f"{label}{_entity_suffix}: **{formatted}**",
+        f"Collection: {_coll_display}",
         f"Query: {query[:120]}"
     ]
     return "\n".join(response_lines)
@@ -561,28 +562,8 @@ def _executive_summary_lines(data: Any, query: str,
         query=query,
     )
     echo_collection = explicit_collection or _infer_collection_from_entity(entity)
-    # FIX 4: Include query keywords in context lines for semantic relevance (F06)
-    _ECHO_STOP = {
-        'get', 'show', 'list', 'find', 'give', 'fetch', 'retrieve',
-        'me', 'all', 'the', 'a', 'an', 'of', 'for', 'in', 'on',
-        'at', 'to', 'by', 'is', 'are', 'was', 'were', 'do', 'does',
-        'this', 'that', 'these', 'those', 'and', 'or', 'with',
-    }
-    _q_keywords = [
-        w for w in re.sub(r'[^\w\s]', ' ', query).split()
-        if w.lower() not in _ECHO_STOP and len(w) > 2
-    ]
-    _q_echo = " ".join(_q_keywords[:7])
-    echo_line_1 = (
-        f"Showing results for: {_q_echo} | "
-        f"Here are {returned_count} {entity} records | "
-        f"Collection: {echo_collection}"
-    )
-    echo_line_2 = (
-        f"Query: {query[:80]} | "
-        f"Filter: {echo_filter} | "
-        f"Returned: {returned_count} records"
-    )
+    echo_line_1 = f"Collection: {echo_collection}"
+    echo_line_2 = f"Applied filters: {echo_filter}"
 
     # Handle numeric count
     if isinstance(data, (int, float)):
@@ -1014,7 +995,22 @@ def _build_natural_filter_description(filters: dict) -> str:
         if sval in ("none", "null", "", "{}"):
             continue
         field = str(key).replace("_", " ").replace("At", "").strip()
-        parts.append(f"with {field}: {val}")
+        rendered = ""
+        if isinstance(val, dict):
+            if "$in" in val and isinstance(val.get("$in"), list):
+                rendered = ", ".join(str(x) for x in val.get("$in", [])[:3])
+            elif "$regex" in val:
+                rendered = str(val.get("$regex", ""))
+            elif "$gte" in val or "$lte" in val:
+                low = val.get("$gte")
+                high = val.get("$lte")
+                if low is not None and high is not None:
+                    rendered = f"{low} to {high}"
+            elif "$ne" in val:
+                rendered = f"not {val.get('$ne')}"
+        if not rendered:
+            rendered = str(val)
+        parts.append(f"with {field}: {rendered}")
     return " and ".join(parts[:2]) if parts else ""
 
 

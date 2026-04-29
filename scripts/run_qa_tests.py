@@ -255,8 +255,11 @@ def check_11_query_complexity(response: str, query: str) -> Tuple[bool, str]:
     return False, "Unstructured short response"
 
 def check_12_limit_handling(response: str, query: str) -> Tuple[bool, str]:
-    """'Top 10' queries must return ≤ 10 rows; 'last 5' must return ≤ 5."""
+    """'Top 10' queries must return ≤ 10 rows; 'last 5' must return ≤ 5.
+    Temporal 'last N months/weeks/days/years' patterns are NOT row-count limits.
+    """
     q_lower = query.lower()
+    _TEMPORAL = re.compile(r"\s*(?:month|week|day|year|hour|minute)s?\b")
     top_match = re.search(r"top\s+(\d+)", q_lower)
     last_match = re.search(r"last\s+(\d+)", q_lower)
     if top_match:
@@ -266,6 +269,10 @@ def check_12_limit_handling(response: str, query: str) -> Tuple[bool, str]:
             return False, f"Got {len(numbered)} rows, expected ≤ {n}"
         return True, f"Top-{n} constraint respected"
     if last_match:
+        # Skip if the matched number is followed by a temporal unit
+        # e.g. "last 6 months" is a date filter, not a row-count limit
+        if _TEMPORAL.match(q_lower, last_match.end()):
+            return True, "N/A (temporal expression, not a row limit)"
         n = int(last_match.group(1))
         numbered = re.findall(r"^\d+\.", response, re.MULTILINE)
         if numbered and len(numbered) > n:

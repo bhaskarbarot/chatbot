@@ -159,6 +159,7 @@ class ChatOrchestrator:
         self._collection_token_cache: Dict[str, set] = {}
         self._warmup_started = False
         self._current_query: str = ""
+        self._current_query_cacheable: bool = True
         self._start_background_warmup()
 
     def _start_background_warmup(self):
@@ -251,10 +252,26 @@ class ChatOrchestrator:
             })
 
             # === ENHANCEMENT 1: Deep query understanding ===
+            # Hard 5s wall-clock timeout: llm.invoke() can block indefinitely
+            # despite the constructor timeout=3 setting in ChatOllama.
+            # On timeout → instant pure-Python rule-based fallback (no LLM).
             deep_understanding = {}
             try:
                 if _deep_understander is not None:
-                    deep_understanding = _deep_understander.understand(resolved_query)
+                    from concurrent.futures import TimeoutError as _FutureTimeoutError
+                    from knowledge.deep_query_understander import _rule_based_understand as _dqu_fallback
+                    with ThreadPoolExecutor(max_workers=1) as _dqu_exec:
+                        _dqu_fut = _dqu_exec.submit(
+                            _deep_understander.understand, resolved_query
+                        )
+                        try:
+                            deep_understanding = _dqu_fut.result(timeout=5.0)
+                        except _FutureTimeoutError:
+                            logger.warning(
+                                "[DeepUnderstander] LLM blocked >5s — "
+                                "switching to rule-based fallback"
+                            )
+                            deep_understanding = _dqu_fallback(resolved_query)
                     self._log("DeepUnderstander",
                               f"shape={deep_understanding.get('response_shape')} "
                               f"limit={deep_understanding.get('result_limit')} "
@@ -319,8 +336,28 @@ class ChatOrchestrator:
             format_hint = detect_format_intent(user_query)
             self._log("Format intent", format_hint)
 
+            # Context-dependent queries (follow-ups/pronouns) must not use global cache hits
+            # because the correct answer depends on the previous turn state.
+            _query_lower_for_cache = user_query.lower()
+            _has_followup_pronoun = bool(
+                re.search(r"\b(those|them|they|again|same|that)\b", _query_lower_for_cache)
+            )
+            # "this month/year/week/quarter/today" is temporal intent, not follow-up pronoun usage.
+            _this_is_temporal = bool(
+                re.search(r"\bthis\s+(month|year|week|quarter|today)\b", _query_lower_for_cache)
+            )
+            _contextual_pronoun_query = _has_followup_pronoun or (
+                bool(re.search(r"\bthis\b", _query_lower_for_cache)) and not _this_is_temporal
+            )
+            _context_dependent_query = bool(
+                is_followup or _resolved_context or _contextual_pronoun_query
+            )
+            self._current_query_cacheable = not _context_dependent_query
+
             # Step 3.1: Redis semantic cache lookup
-            cache_hit = self.cache.get_best(resolved_query)
+            cache_hit = None if _context_dependent_query else self.cache.get_best(resolved_query)
+            if _context_dependent_query:
+                logger.info("[Cache] Bypassing cache for context-dependent follow-up query")
             if cache_hit and isinstance(cache_hit.payload, dict):
                 cached_response = cache_hit.payload.get("response")
                 if cached_response:
@@ -666,7 +703,7 @@ class ChatOrchestrator:
             if (not self._is_empty_result(data)
                     and self._should_run_relevance_verifier(resolved_query, data)
                     and matched_rules
-                    and (time.time() - start_time) < max(8, MAX_RESPONSE_TIME * 0.4)):
+                    and (time.time() - start_time) < 8.0):
                 self._log("Verifier", "Low relevance detected, attempting corrective replan")
                 verify_query = (
                     f"{resolved_query}\n\n"
@@ -689,7 +726,7 @@ class ChatOrchestrator:
             # FIX 3: hard cap at 12s to leave budget for formatting + healing
             _replan_attempts = 0
             if self._is_empty_result(data):
-                time_ok = (time.time() - start_time) < min(12.0, MAX_RESPONSE_TIME * 0.4)
+                time_ok = (time.time() - start_time) < 10.0
                 if matched_rules and time_ok and _replan_attempts < 1:
                     _replan_attempts += 1
                     self._log("Replan", "No results — retrying with semantic hint")
@@ -743,9 +780,9 @@ class ChatOrchestrator:
 
             shape_instructions = {}
             # === ENHANCEMENT 7: Self-healing retry (after ALL existing fallbacks) ===
-            # FIX 3: Skip self-healing if already over 22s to stay under 30s budget
+            # FIX 3: Skip self-healing if already over 17s to stay under 30s budget
             _elapsed_before_heal = time.time() - start_time
-            if _elapsed_before_heal > 22.0:
+            if _elapsed_before_heal > 17.0:
                 _validation_meta["needs_self_healing"] = False
                 logger.info(
                     f"[TimeBudget] Skipping self-healing: "
@@ -753,7 +790,7 @@ class ChatOrchestrator:
                 )
             if (
                 self._is_empty_result(data)
-                and _elapsed_before_heal <= 22.0
+                and _elapsed_before_heal <= 17.0
                 and enriched_intent.get("primary_intent") != "existence_check"
                 and enriched_intent.get("primary_intent") != "greeting"
                 and enriched_intent.get("response_shape") != "yes_no"
@@ -940,7 +977,12 @@ class ChatOrchestrator:
 
         # Step 1: Generate plans sequentially (Ollama is single-threaded)
         plans: List[Tuple[str, Dict]] = []
+        _worker_plan_start = time.time()
         for sq in sub_queries:
+            if time.time() - _worker_plan_start > 20.0:
+                self._log("DynamicWorker",
+                          f"Plan budget (20s) exceeded — stopping at {len(plans)} plan(s)")
+                break
             try:
                 matched_rules = keyword_boost_search(sq, top_k=3) if is_index_built() else []
                 query_plan = None
@@ -2624,6 +2666,7 @@ class ChatOrchestrator:
             and format_type not in {"greeting", "out_of_scope"}
             and self._is_cacheable_response(response)
             and self._current_query
+            and self._current_query_cacheable
         ):
             self.cache.set(self._current_query, result)
         return result

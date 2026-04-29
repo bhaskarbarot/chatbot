@@ -342,9 +342,14 @@ def check_11_complexity(response, query):
 
 def check_12_limits(response, query):
     q = query.lower()
+    _TEMPORAL = re.compile(r"\s*(?:month|week|day|year|hour|minute)s?\b")
     for pat in [r"top\s+(\d+)", r"last\s+(\d+)", r"(\d+)\s+contacts?"]:
         m = re.search(pat, q)
         if m:
+            # Skip if the number is immediately followed by a temporal unit
+            # e.g. "last 6 months" is a date range, not a row-count limit
+            if _TEMPORAL.match(q, m.end(1)):
+                continue
             n = int(m.group(1))
             rows = re.findall(r"^\d+\.", response, re.MULTILINE)
             if rows and len(rows) > n:

@@ -37,7 +37,7 @@ RETRIEVAL_MIN_MARGIN = float(os.getenv("RETRIEVAL_MIN_MARGIN", "0.06"))
 # ── Cache (Redis) ────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.88"))
+CACHE_SIMILARITY_THRESHOLD = float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.85"))
 
 # ── Logging ──────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
