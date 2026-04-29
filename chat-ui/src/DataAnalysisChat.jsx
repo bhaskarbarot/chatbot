@@ -451,8 +451,30 @@ function TimingBadge({ ms }) {
 
 function MessageBubble({ msg }) {
   const isUser = msg.role === "user";
+  const parsedContent = (() => {
+    if (isUser || typeof msg.content !== "string") {
+      return { display: msg.content, collection: null, appliedFilters: null };
+    }
+    const lines = msg.content.split("\n");
+    let collection = null;
+    let appliedFilters = null;
+    const kept = [];
+    for (const line of lines) {
+      const cleanLine = line.trim();
+      if (!collection && /^Collection:/i.test(cleanLine)) {
+        collection = cleanLine.replace(/^Collection:\s*/i, "").trim();
+        continue;
+      }
+      if (!appliedFilters && /^Applied filters:/i.test(cleanLine)) {
+        appliedFilters = cleanLine.replace(/^Applied filters:\s*/i, "").trim();
+        continue;
+      }
+      kept.push(line);
+    }
+    return { display: kept.join("\n").trim(), collection, appliedFilters };
+  })();
   // Detect if the answer text already contains a rendered table (|...|) to avoid double render
-  const answerHasTable = !isUser && typeof msg.content === "string" && /\|.+\|/.test(msg.content);
+  const answerHasTable = !isUser && typeof parsedContent.display === "string" && /\|.+\|/.test(parsedContent.display);
 
   return (
     <div className={`message-row message-row--${isUser ? "user" : "bot"}`}>
@@ -468,7 +490,7 @@ function MessageBubble({ msg }) {
           )}
         </div>
         <div className={`bubble bubble--${isUser ? "user" : "bot"}`}>
-          <span dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+          <span dangerouslySetInnerHTML={{ __html: renderMarkdown(parsedContent.display || msg.content) }} />
         </div>
         {!isUser && (
           <div className="message-extras">
@@ -477,6 +499,12 @@ function MessageBubble({ msg }) {
               <CopyButton text={msg.content} />
             </div>
             <Collapsible title="Source & Details">
+              {(parsedContent.collection || parsedContent.appliedFilters) && (
+                <div className="message-perf">
+                  {parsedContent.collection && <span>Collection: {parsedContent.collection}</span>}
+                  {parsedContent.appliedFilters && <span>Applied filters: {parsedContent.appliedFilters}</span>}
+                </div>
+              )}
               <QueryPlan plan={msg.query_plan} />
               {msg.query_used && (
                 <Collapsible title="MongoDB Query">
